@@ -6,6 +6,7 @@ import time
 import ftplib
 import posixpath
 import threading
+import itertools
 from datetime import datetime
 from PySide6.QtCore import (Qt,
                             Signal,
@@ -19,12 +20,14 @@ from PySide6.QtCore import (Qt,
 from PySide6.QtGui import (QIcon,
                            QFontDatabase,
                            QAction,
-                           QTextCursor)
+                           QKeySequence,
+                           QShortcut)
 from PySide6.QtWidgets import (QApplication,
                                QWidget,
                                QLabel,
                                QMainWindow,
                                QPushButton,
+                               QToolButton,
                                QMessageBox,
                                QHBoxLayout,
                                QVBoxLayout,
@@ -40,6 +43,7 @@ from PySide6.QtWidgets import (QApplication,
                                QPlainTextEdit,
                                QProgressBar,
                                QSplitter,
+                               QTabWidget,
                                QTreeView,
                                QTreeWidget,
                                QTreeWidgetItem,
@@ -58,7 +62,6 @@ from ftp_core import (ConnectionSettings,
                       list_dir,
                       remote_abspath,
                       remote_rmtree,
-                      parse_path_list,
                       human_size,
                       human_time,
                       MODE_COPY,
@@ -69,17 +72,17 @@ from ftp_core import (ConnectionSettings,
                       DIRECTION_UPLOAD,
                       DIRECTION_DOWNLOAD)
 
-SETTINGS_FILE = 'settings.json'
-REMOTE_PREFIX = 'remote:'
-REMOTE_MIME = 'application/x-pyftpclient-remote-paths'
-
-DIRECTION_AUTO = 'auto'
+SETTINGS_FILE = os.path.abspath('settings.json')
+REMOTE_MIME = 'application/x-pyftpclient-remote-items'
 
 LOG_COLORS = {'info': '#d4d4d4',
               'success': '#6a9955',
               'warning': '#dcdcaa',
               'error': '#f44747',
               'progress': '#569cd6'}
+LOG_TAGS = {'warning': 'WARN ', 'error': 'ERROR', 'success': 'OK   ', 'progress': 'PROG '}
+
+_session_ids = itertools.count(1)
 
 
 def get_running_path(relative_path):
@@ -111,8 +114,17 @@ def save_settings(data):
         print(f'Could not save settings: {e}')
 
 
+def decode_remote_mime(mime):
+    if not mime.hasFormat(REMOTE_MIME):
+        return None
+    try:
+        return json.loads(bytes(mime.data(REMOTE_MIME)).decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
 class RemoteBrowserWorker(QObject):
-    """Owns the browsing FTP connection; lives in its own thread so the GUI never blocks."""
+    """Owns the browsing FTP connection of one session; lives in its own thread so the GUI never blocks."""
     connected = Signal(str)
     disconnected = Signal()
     listed = Signal(str, object)
@@ -124,6 +136,14 @@ class RemoteBrowserWorker(QObject):
         super().__init__()
         self.ftp = None
         self.settings = None
+
+    def _drop(self):
+        if self.ftp is not None:
+            try:
+                self.ftp.close()
+            except Exception:
+                pass
+        self.ftp = None
 
     def _call(self, description, func):
         self.busy.emit(True)
@@ -145,14 +165,6 @@ class RemoteBrowserWorker(QObject):
         finally:
             self.busy.emit(False)
 
-    def _drop(self):
-        if self.ftp is not None:
-            try:
-                self.ftp.close()
-            except Exception:
-                pass
-        self.ftp = None
-
     def _list(self, path):
         def do(ftp):
             abs_path = remote_abspath(ftp, path)
@@ -160,8 +172,8 @@ class RemoteBrowserWorker(QObject):
         abs_path, entries = self._call(f'Listing {path}', do)
         self.listed.emit(abs_path, entries)
 
-    @Slot(object)
-    def connect_to(self, settings):
+    @Slot(object, str)
+    def connect_to(self, settings, start_path):
         safe_close(self.ftp)
         self.ftp = None
         self.settings = settings
@@ -181,13 +193,14 @@ class RemoteBrowserWorker(QObject):
             self.settings = None
             self._drop()
             self.failed.emit(f'Connection failed: {e}')
-            self.busy.emit(False)
             return
-        self.busy.emit(False)
+        finally:
+            self.busy.emit(False)
         try:
-            self._list(cwd)
+            self._list(start_path or cwd)
         except Exception as e:
-            self.failed.emit(f'Listing failed: {e}')
+            self.log.emit(f'Cannot open {start_path}: {e}; falling back to {cwd}', 'warning')
+            self.list_path(cwd)
 
     @Slot()
     def disconnect_from(self):
@@ -244,131 +257,152 @@ class TransferWorker(QThread):
     progress = Signal(object)
     done = Signal(object)
 
-    def __init__(self, settings, options, jobs):
+    def __init__(self, settings, options, direction, paths, destination):
         super().__init__()
         self.settings = settings
         self.options = options
-        self.jobs = jobs
+        self.direction = direction
+        self.paths = paths
+        self.destination = destination
         self.cancel_event = threading.Event()
 
     def cancel(self):
         self.cancel_event.set()
 
     def run(self):
-        totals = {'ok': 0, 'skipped': 0, 'failed': 0, 'bytes': 0, 'cancelled': False}
-        started = time.monotonic()
-        for index, (direction, paths, destination) in enumerate(self.jobs, 1):
-            if self.cancel_event.is_set():
-                totals['cancelled'] = True
-                break
-            label = 'Upload' if direction == DIRECTION_UPLOAD else 'Download'
-            self.log.emit(f'=== Job {index}/{len(self.jobs)}: {label} ===', 'info')
-
-            def on_progress(info, label=label, index=index):
-                info['job'] = f'{label} {index}/{len(self.jobs)}'
-                self.progress.emit(info)
-
-            engine = TransferEngine(self.settings, self.options, self.log.emit, on_progress, self.cancel_event)
-            stats = engine.run(direction, paths, destination)
-            for key in ('ok', 'skipped', 'failed', 'bytes'):
-                totals[key] += stats.get(key, 0)
-            if stats.get('cancelled'):
-                totals['cancelled'] = True
-                break
-        totals['elapsed'] = time.monotonic() - started
-        self.done.emit(totals)
+        engine = TransferEngine(self.settings, self.options, self.log.emit, self.progress.emit, self.cancel_event)
+        self.done.emit(engine.run(self.direction, self.paths, self.destination))
 
 
-class PathInputBox(QPlainTextEdit):
-    """Multi-line path input that accepts drops from the OS file manager and from both browsers."""
+class LocalTree(QTreeView):
+    """Local browser; accepts remote items dragged from the remote browser of the same session (=> download)."""
+    remote_dropped = Signal(object, str)
 
-    def __init__(self):
+    def __init__(self, session_id):
         super().__init__()
+        self.session_id = session_id
         self.setAcceptDrops(True)
-        self.setPlaceholderText('One path per line (or several "quoted paths" on a line). Files and folders are both '
-                                'accepted.\nLocal paths are uploaded; lines starting with "remote:" are downloaded.\n'
-                                'You can also drag & drop from the file manager or from the two browsers above.')
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setDefaultDropAction(Qt.CopyAction)
 
-    def add_paths(self, paths):
-        existing = self.toPlainText().rstrip('\n')
-        current = set(line.strip() for line in existing.splitlines())
-        new = [p for p in paths if p not in current]
-        if not new:
-            return
-        self.setPlainText((existing + '\n' if existing else '') + '\n'.join(new))
-        self.moveCursor(QTextCursor.End)
+    def _payload(self, event):
+        data = decode_remote_mime(event.mimeData())
+        return data if data and data.get('session') == self.session_id else None
 
-    def canInsertFromMimeData(self, source):
-        return source.hasUrls() or source.hasFormat(REMOTE_MIME) or super().canInsertFromMimeData(source)
-
-    def insertFromMimeData(self, source):
-        if source.hasFormat(REMOTE_MIME):
-            data = bytes(source.data(REMOTE_MIME)).decode('utf-8')
-            self.add_paths([REMOTE_PREFIX + p for p in data.splitlines() if p])
-        elif source.hasUrls():
-            paths = [QDir.toNativeSeparators(u.toLocalFile()) for u in source.urls() if u.isLocalFile()]
-            self.add_paths(paths)
+    def dragEnterEvent(self, event):
+        if self._payload(event):
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
         else:
-            super().insertFromMimeData(source)
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        data = self._payload(event)
+        if not data:
+            event.ignore()
+            return
+        index = self.indexAt(event.position().toPoint())
+        target = self.model().filePath(index) if index.isValid() and self.model().isDir(index) else ''
+        event.setDropAction(Qt.CopyAction)
+        event.accept()
+        self.remote_dropped.emit(data['paths'], target)
 
 
 class RemoteTree(QTreeWidget):
-    def mimeData(self, items):
-        paths = [it.data(0, Qt.UserRole) for it in items if it.data(0, Qt.UserRole + 2) != '..']
-        mime = QMimeData()
-        mime.setData(REMOTE_MIME, QByteArray('\n'.join(paths).encode('utf-8')))
-        mime.setText('\n'.join(REMOTE_PREFIX + p for p in paths))
-        return mime
+    """Remote browser; accepts local files/folders from the local browser or the OS file manager (=> upload)."""
+    local_dropped = Signal(object, str)
+
+    def __init__(self, session_id):
+        super().__init__()
+        self.session_id = session_id
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setDefaultDropAction(Qt.CopyAction)
 
     def mimeTypes(self):
-        return [REMOTE_MIME, 'text/plain']
+        return [REMOTE_MIME]
+
+    def mimeData(self, items):
+        paths = [[it.data(0, Qt.UserRole), bool(it.data(0, Qt.UserRole + 1))]
+                 for it in items if it.data(0, Qt.UserRole + 2) != '..']
+        mime = QMimeData()
+        mime.setData(REMOTE_MIME, QByteArray(json.dumps({'session': self.session_id,
+                                                         'paths': paths}).encode('utf-8')))
+        return mime
+
+    def supportedDropActions(self):
+        return Qt.CopyAction
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasUrls() and any(u.isLocalFile() for u in mime.urls()):
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        mime = event.mimeData()
+        paths = [QDir.toNativeSeparators(u.toLocalFile()) for u in mime.urls() if u.isLocalFile()]
+        if not paths:
+            event.ignore()
+            return
+        item = self.itemAt(event.position().toPoint())
+        target = item.data(0, Qt.UserRole) if item is not None and item.data(0, Qt.UserRole + 1) else ''
+        event.setDropAction(Qt.CopyAction)
+        event.accept()
+        self.local_dropped.emit(paths, target)
 
 
-class FTPClientWindow(QMainWindow):
-    req_connect = Signal(object)
+class SessionTab(QWidget):
+    """One self-contained session: connection, local + remote browsers, transfer queue, progress and console."""
+    title_changed = Signal()
+
+    req_connect = Signal(object, str)
     req_disconnect = Signal()
     req_list = Signal(str)
     req_mkdir = Signal(str, str)
     req_rename = Signal(str, str, str)
     req_delete = Signal(object, str)
 
-    def __init__(self):
+    def __init__(self, settings=None):
         super().__init__()
-        self.settings_data = load_settings()
-        self.setWindowTitle('pyFTPclient V' + read_version())
-        self.resize(1300, 900)
-        icon_path = get_running_path('icon.ico')
-        if os.path.isfile(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
-
+        self.session_id = next(_session_ids)
+        self.custom_name = ''
         self.remote_cwd = ''
         self.remote_connected = False
+        self.status_suffix = ''
         self.transfer_worker = None
+        self.queue = []
         self._last_console_progress = 0.0
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._build_connection_box())
 
-        main_layout.addWidget(self._build_connection_box())
-
-        vertical_splitter = QSplitter(Qt.Vertical)
-        browsers_splitter = QSplitter(Qt.Horizontal)
-        browsers_splitter.addWidget(self._build_local_browser())
-        browsers_splitter.addWidget(self._build_remote_browser())
-        browsers_splitter.setSizes([650, 650])
-        vertical_splitter.addWidget(browsers_splitter)
-        vertical_splitter.addWidget(self._build_transfer_box())
-        vertical_splitter.addWidget(self._build_console_box())
-        vertical_splitter.setStretchFactor(0, 3)
-        vertical_splitter.setStretchFactor(1, 2)
-        vertical_splitter.setStretchFactor(2, 2)
-        main_layout.addWidget(vertical_splitter)
+        vertical = QSplitter(Qt.Vertical)
+        browsers = QSplitter(Qt.Horizontal)
+        browsers.addWidget(self._build_local_browser())
+        browsers.addWidget(self._build_remote_browser())
+        browsers.setSizes([600, 600])
+        vertical.addWidget(browsers)
+        vertical.addWidget(self._build_transfer_panel())
+        vertical.addWidget(self._build_console_box())
+        vertical.setStretchFactor(0, 4)
+        vertical.setStretchFactor(1, 0)
+        vertical.setStretchFactor(2, 2)
+        layout.addWidget(vertical)
 
         self._setup_browser_thread()
-        self._apply_settings()
         self._set_remote_state(False)
-        self.log(f'pyFTPclient V{read_version()} started on {sys.platform}', 'info')
+        self.apply_settings(settings or {})
 
     def _build_connection_box(self):
         box = QGroupBox('Connection')
@@ -376,6 +410,7 @@ class FTPClientWindow(QMainWindow):
 
         self.host_edit = QLineEdit()
         self.host_edit.setPlaceholderText('ftp.example.com')
+        self.host_edit.textChanged.connect(lambda _text: self.title_changed.emit())
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(21)
@@ -409,39 +444,33 @@ class FTPClientWindow(QMainWindow):
         layout.addWidget(self.connect_button)
         return box
 
+    def _icon_button(self, icon, tooltip, slot):
+        button = QPushButton()
+        button.setIcon(self.style().standardIcon(icon))
+        button.setToolTip(tooltip)
+        button.clicked.connect(slot)
+        return button
+
     def _build_local_browser(self):
         box = QGroupBox('Local')
         layout = QVBoxLayout(box)
-        style = self.style()
 
         nav = QHBoxLayout()
-        up_button = QPushButton()
-        up_button.setIcon(style.standardIcon(QStyle.SP_FileDialogToParent))
-        up_button.setToolTip('Parent folder')
-        up_button.clicked.connect(self.local_up)
-        home_button = QPushButton()
-        home_button.setIcon(style.standardIcon(QStyle.SP_DirHomeIcon))
-        home_button.setToolTip('Home folder')
-        home_button.clicked.connect(lambda: self.set_local_dir(os.path.expanduser('~')))
-        browse_button = QPushButton('...')
-        browse_button.setToolTip('Pick folder')
-        browse_button.clicked.connect(self.pick_local_dir)
         self.local_path_edit = QLineEdit()
         self.local_path_edit.returnPressed.connect(lambda: self.set_local_dir(self.local_path_edit.text()))
-        nav.addWidget(up_button)
-        nav.addWidget(home_button)
+        nav.addWidget(self._icon_button(QStyle.SP_FileDialogToParent, 'Parent folder', self.local_up))
+        nav.addWidget(self._icon_button(QStyle.SP_DirHomeIcon, 'Home folder',
+                                        lambda: self.set_local_dir(os.path.expanduser('~'))))
         nav.addWidget(self.local_path_edit)
-        nav.addWidget(browse_button)
+        nav.addWidget(self._icon_button(QStyle.SP_DirOpenIcon, 'Pick folder', self.pick_local_dir))
         layout.addLayout(nav)
 
         self.local_model = QFileSystemModel()
         self.local_model.setRootPath('')
         self.local_model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot | QDir.Hidden | QDir.System)
-        self.local_view = QTreeView()
+        self.local_view = LocalTree(self.session_id)
         self.local_view.setModel(self.local_model)
         self.local_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.local_view.setDragEnabled(True)
-        self.local_view.setDragDropMode(QAbstractItemView.DragOnly)
         self.local_view.setSortingEnabled(True)
         self.local_view.sortByColumn(0, Qt.AscendingOrder)
         self.local_view.setItemsExpandable(False)
@@ -452,120 +481,54 @@ class FTPClientWindow(QMainWindow):
         self.local_view.doubleClicked.connect(self.local_double_clicked)
         self.local_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.local_view.customContextMenuRequested.connect(self.local_context_menu)
+        self.local_view.remote_dropped.connect(self.on_remote_dropped)
         layout.addWidget(self.local_view)
 
-        buttons = QHBoxLayout()
-        add_button = QPushButton('Add selected to input')
-        add_button.clicked.connect(self.add_local_selection)
         upload_button = QPushButton('Upload selected  \u2192')
-        upload_button.clicked.connect(lambda: self.quick_transfer(DIRECTION_UPLOAD))
-        buttons.addWidget(add_button)
-        buttons.addWidget(upload_button)
-        layout.addLayout(buttons)
+        upload_button.clicked.connect(lambda: self.upload_selection())
+        layout.addWidget(upload_button)
         return box
 
     def _build_remote_browser(self):
         box = QGroupBox('Remote')
         layout = QVBoxLayout(box)
-        style = self.style()
 
         nav = QHBoxLayout()
-        self.remote_up_button = QPushButton()
-        self.remote_up_button.setIcon(style.standardIcon(QStyle.SP_FileDialogToParent))
-        self.remote_up_button.setToolTip('Parent folder')
-        self.remote_up_button.clicked.connect(self.remote_up)
-        self.remote_refresh_button = QPushButton()
-        self.remote_refresh_button.setIcon(style.standardIcon(QStyle.SP_BrowserReload))
-        self.remote_refresh_button.setToolTip('Refresh')
-        self.remote_refresh_button.clicked.connect(self.remote_refresh)
-        self.remote_mkdir_button = QPushButton()
-        self.remote_mkdir_button.setIcon(style.standardIcon(QStyle.SP_FileDialogNewFolder))
-        self.remote_mkdir_button.setToolTip('New folder')
-        self.remote_mkdir_button.clicked.connect(self.remote_mkdir)
+        self.remote_up_button = self._icon_button(QStyle.SP_FileDialogToParent, 'Parent folder', self.remote_up)
+        self.remote_refresh_button = self._icon_button(QStyle.SP_BrowserReload, 'Refresh (F5)', self.remote_refresh)
+        self.remote_mkdir_button = self._icon_button(QStyle.SP_FileDialogNewFolder, 'New folder', self.remote_mkdir)
         self.remote_path_edit = QLineEdit()
         self.remote_path_edit.returnPressed.connect(lambda: self.request_remote_list(self.remote_path_edit.text()))
         self.remote_busy_label = QLabel('')
-        nav.addWidget(self.remote_up_button)
-        nav.addWidget(self.remote_refresh_button)
-        nav.addWidget(self.remote_mkdir_button)
-        nav.addWidget(self.remote_path_edit)
-        nav.addWidget(self.remote_busy_label)
+        for w in (self.remote_up_button, self.remote_refresh_button, self.remote_mkdir_button,
+                  self.remote_path_edit, self.remote_busy_label):
+            nav.addWidget(w)
         layout.addLayout(nav)
 
-        self.remote_tree = RemoteTree()
+        self.remote_tree = RemoteTree(self.session_id)
         self.remote_tree.setHeaderLabels(['Name', 'Size', 'Modified'])
         self.remote_tree.setRootIsDecorated(False)
         self.remote_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.remote_tree.setDragEnabled(True)
-        self.remote_tree.setDragDropMode(QAbstractItemView.DragOnly)
         self.remote_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.remote_tree.header().setStretchLastSection(False)
         self.remote_tree.itemDoubleClicked.connect(self.remote_double_clicked)
         self.remote_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.remote_tree.customContextMenuRequested.connect(self.remote_context_menu)
+        self.remote_tree.local_dropped.connect(self.on_local_dropped)
         layout.addWidget(self.remote_tree)
 
-        buttons = QHBoxLayout()
-        self.remote_add_button = QPushButton('Add selected to input')
-        self.remote_add_button.clicked.connect(self.add_remote_selection)
         self.remote_download_button = QPushButton('\u2190  Download selected')
-        self.remote_download_button.clicked.connect(lambda: self.quick_transfer(DIRECTION_DOWNLOAD))
-        buttons.addWidget(self.remote_add_button)
-        buttons.addWidget(self.remote_download_button)
-        layout.addLayout(buttons)
+        self.remote_download_button.clicked.connect(lambda: self.download_selection())
+        layout.addWidget(self.remote_download_button)
         return box
 
-    def _build_transfer_box(self):
-        box = QGroupBox('Transfer')
-        layout = QHBoxLayout(box)
+    def _build_transfer_panel(self):
+        panel = QWidget()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        left = QVBoxLayout()
-        input_header = QHBoxLayout()
-        input_header.addWidget(QLabel('Paths to transfer (files and/or folders):'))
-        input_header.addStretch()
-        browse_files = QPushButton('Add files...')
-        browse_files.clicked.connect(self.pick_input_files)
-        browse_folder = QPushButton('Add folder...')
-        browse_folder.clicked.connect(self.pick_input_folder)
-        clear_input = QPushButton('Clear')
-        clear_input.clicked.connect(lambda: self.path_input.clear())
-        input_header.addWidget(browse_files)
-        input_header.addWidget(browse_folder)
-        input_header.addWidget(clear_input)
-        left.addLayout(input_header)
-        self.path_input = PathInputBox()
-        left.addWidget(self.path_input)
-
-        dest_grid = QGridLayout()
-        self.remote_dest_edit = QLineEdit()
-        self.remote_dest_edit.setPlaceholderText('remote folder (uploads go here)')
-        remote_dest_btn = QPushButton('Use current remote')
-        remote_dest_btn.clicked.connect(lambda: self.remote_dest_edit.setText(self.remote_cwd))
-        self.local_dest_edit = QLineEdit()
-        self.local_dest_edit.setPlaceholderText('local folder (downloads go here)')
-        local_dest_btn = QPushButton('Use current local')
-        local_dest_btn.clicked.connect(lambda: self.local_dest_edit.setText(self.local_path_edit.text()))
-        local_dest_pick = QPushButton('...')
-        local_dest_pick.clicked.connect(self.pick_local_dest)
-        dest_grid.addWidget(QLabel('Upload to (remote):'), 0, 0)
-        dest_grid.addWidget(self.remote_dest_edit, 0, 1, 1, 2)
-        dest_grid.addWidget(remote_dest_btn, 0, 3)
-        dest_grid.addWidget(QLabel('Download to (local):'), 1, 0)
-        dest_grid.addWidget(self.local_dest_edit, 1, 1)
-        dest_grid.addWidget(local_dest_pick, 1, 2)
-        dest_grid.addWidget(local_dest_btn, 1, 3)
-        left.addLayout(dest_grid)
-        layout.addLayout(left, 3)
-
-        right = QVBoxLayout()
         options_box = QGroupBox('Options')
         grid = QGridLayout(options_box)
-
-        self.direction_combo = QComboBox()
-        self.direction_combo.addItem('Auto (local \u2192 upload, remote: \u2192 download)', DIRECTION_AUTO)
-        self.direction_combo.addItem('Upload all (local \u2192 remote)', DIRECTION_UPLOAD)
-        self.direction_combo.addItem('Download all (remote \u2192 local)', DIRECTION_DOWNLOAD)
-
         self.copy_radio = QRadioButton('Copy')
         self.move_radio = QRadioButton('Move')
         self.copy_radio.setChecked(True)
@@ -594,41 +557,29 @@ class FTPClientWindow(QMainWindow):
         self.exists_combo.addItem('Resume partial / skip identical', EXISTS_RESUME)
         self.exists_combo.addItem('Overwrite', EXISTS_OVERWRITE)
         self.exists_combo.addItem('Skip', EXISTS_SKIP)
-        self.verify_check = QCheckBox('Verify size after transfer')
-        self.verify_check.setChecked(True)
         self.console_interval_spin = QDoubleSpinBox()
         self.console_interval_spin.setRange(0.5, 600)
         self.console_interval_spin.setValue(2)
         self.console_interval_spin.setSuffix(' s')
         self.console_interval_spin.setToolTip('How often progress lines are printed in the console')
+        self.verify_check = QCheckBox('Verify size after transfer')
+        self.verify_check.setChecked(True)
 
-        rows = (('Direction:', self.direction_combo),
-                ('Mode:', mode_layout),
-                ('Timeout:', self.timeout_spin),
-                ('Retries:', self.retries_spin),
-                ('Retry delay:', self.retry_delay_spin),
-                ('If target exists:', self.exists_combo),
-                ('Console progress every:', self.console_interval_spin))
-        for row, (label, widget) in enumerate(rows):
-            grid.addWidget(QLabel(label), row, 0)
+        cells = (('Mode:', mode_layout), ('If target exists:', self.exists_combo),
+                 ('Timeout:', self.timeout_spin), ('Retries:', self.retries_spin),
+                 ('Retry delay:', self.retry_delay_spin), ('Console progress every:', self.console_interval_spin))
+        for i, (label, widget) in enumerate(cells):
+            row, col = divmod(i, 2)
+            grid.addWidget(QLabel(label), row, col * 2)
             if isinstance(widget, QHBoxLayout):
-                grid.addLayout(widget, row, 1)
+                grid.addLayout(widget, row, col * 2 + 1)
             else:
-                grid.addWidget(widget, row, 1)
-        grid.addWidget(self.verify_check, len(rows), 0, 1, 2)
-        right.addWidget(options_box)
+                grid.addWidget(widget, row, col * 2 + 1)
+        grid.addWidget(self.verify_check, 3, 0, 1, 4)
+        layout.addWidget(options_box, 1)
 
-        action_layout = QHBoxLayout()
-        self.start_button = QPushButton('Start transfer')
-        self.start_button.setStyleSheet('font-weight: bold; padding: 6px;')
-        self.start_button.clicked.connect(self.start_from_input)
-        self.cancel_button = QPushButton('Cancel')
-        self.cancel_button.setEnabled(False)
-        self.cancel_button.clicked.connect(self.cancel_transfer)
-        action_layout.addWidget(self.start_button)
-        action_layout.addWidget(self.cancel_button)
-        right.addLayout(action_layout)
-
+        progress_box = QGroupBox('Progress')
+        progress_layout = QVBoxLayout(progress_box)
         self.file_progress = QProgressBar()
         self.file_progress.setRange(0, 1000)
         self.file_progress.setFormat('File: -')
@@ -637,12 +588,21 @@ class FTPClientWindow(QMainWindow):
         self.total_progress.setFormat('Total: -')
         self.stats_label = QLabel('Idle')
         self.stats_label.setWordWrap(True)
-        right.addWidget(self.file_progress)
-        right.addWidget(self.total_progress)
-        right.addWidget(self.stats_label)
-        right.addStretch()
-        layout.addLayout(right, 2)
-        return box
+        bottom = QHBoxLayout()
+        self.queue_label = QLabel('Queue: 0')
+        self.cancel_button = QPushButton('Cancel')
+        self.cancel_button.setToolTip('Cancel the running transfer and clear the queue of this tab')
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_transfer)
+        bottom.addWidget(self.queue_label)
+        bottom.addStretch()
+        bottom.addWidget(self.cancel_button)
+        progress_layout.addWidget(self.file_progress)
+        progress_layout.addWidget(self.total_progress)
+        progress_layout.addWidget(self.stats_label)
+        progress_layout.addLayout(bottom)
+        layout.addWidget(progress_box, 1)
+        return panel
 
     def _build_console_box(self):
         box = QGroupBox('Console')
@@ -682,14 +642,19 @@ class FTPClientWindow(QMainWindow):
         self.browser_worker.busy.connect(lambda b: self.remote_busy_label.setText('working...' if b else ''))
         self.browser_thread.start()
 
-    def _apply_settings(self):
-        s = self.settings_data
+    def title(self):
+        return (self.custom_name or self.host_edit.text().strip() or 'New session') + self.status_suffix
+
+    def is_busy(self):
+        return self.transfer_worker is not None or bool(self.queue)
+
+    def apply_settings(self, s):
+        self.custom_name = s.get('tab_name', '')
         self.host_edit.setText(s.get('host', ''))
         self.port_spin.setValue(int(s.get('port', 21)))
         self.user_edit.setText(s.get('user', ''))
         self.remember_pass_check.setChecked(bool(s.get('remember_password', False)))
-        if self.remember_pass_check.isChecked():
-            self.pass_edit.setText(s.get('password', ''))
+        self.pass_edit.setText(s.get('password', ''))
         self.tls_check.setChecked(bool(s.get('use_tls', False)))
         self.passive_check.setChecked(bool(s.get('passive', True)))
         self.encoding_combo.setCurrentText(s.get('encoding', 'utf-8'))
@@ -699,22 +664,17 @@ class FTPClientWindow(QMainWindow):
         self.console_interval_spin.setValue(float(s.get('console_interval', 2)))
         self.verify_check.setChecked(bool(s.get('verify_size', True)))
         (self.move_radio if s.get('mode') == MODE_MOVE else self.copy_radio).setChecked(True)
-        for combo, key in ((self.direction_combo, 'direction'), (self.exists_combo, 'exists_policy')):
-            idx = combo.findData(s.get(key))
-            if idx >= 0:
-                combo.setCurrentIndex(idx)
-        self.remote_dest_edit.setText(s.get('remote_dest', ''))
+        idx = self.exists_combo.findData(s.get('exists_policy'))
+        if idx >= 0:
+            self.exists_combo.setCurrentIndex(idx)
+        self.remote_cwd = s.get('remote_dir', '')
         local_dir = s.get('local_dir') or os.path.expanduser('~')
-        if not os.path.isdir(local_dir):
-            local_dir = os.path.expanduser('~')
-        self.set_local_dir(local_dir)
-        self.local_dest_edit.setText(s.get('local_dest', '') or local_dir)
-        geometry = s.get('geometry')
-        if geometry:
-            self.restoreGeometry(QByteArray.fromBase64(geometry.encode('ascii')))
+        self.set_local_dir(local_dir if os.path.isdir(local_dir) else os.path.expanduser('~'))
+        self.title_changed.emit()
 
-    def _collect_settings(self):
-        data = {'host': self.host_edit.text().strip(),
+    def collect_settings(self, include_password=False):
+        data = {'tab_name': self.custom_name,
+                'host': self.host_edit.text().strip(),
                 'port': self.port_spin.value(),
                 'user': self.user_edit.text(),
                 'remember_password': self.remember_pass_check.isChecked(),
@@ -727,13 +687,10 @@ class FTPClientWindow(QMainWindow):
                 'console_interval': self.console_interval_spin.value(),
                 'verify_size': self.verify_check.isChecked(),
                 'mode': MODE_MOVE if self.move_radio.isChecked() else MODE_COPY,
-                'direction': self.direction_combo.currentData(),
                 'exists_policy': self.exists_combo.currentData(),
-                'remote_dest': self.remote_dest_edit.text(),
-                'local_dest': self.local_dest_edit.text(),
                 'local_dir': self.local_path_edit.text(),
-                'geometry': bytes(self.saveGeometry().toBase64()).decode('ascii')}
-        if data['remember_password']:
+                'remote_dir': self.remote_cwd}
+        if include_password or data['remember_password']:
             data['password'] = self.pass_edit.text()
         return data
 
@@ -758,10 +715,9 @@ class FTPClientWindow(QMainWindow):
     def log(self, message, level='info'):
         color = LOG_COLORS.get(level, LOG_COLORS['info'])
         stamp = datetime.now().strftime('%H:%M:%S')
-        tag = {'warning': 'WARN ', 'error': 'ERROR', 'success': 'OK   ', 'progress': 'PROG '}.get(level, 'INFO ')
         safe = html.escape(message).replace('\n', '<br>')
         self.console.appendHtml(f'<span style="color:#808080">[{stamp}]</span> '
-                                f'<span style="color:{color}">{tag} {safe}</span>')
+                                f'<span style="color:{color}">{LOG_TAGS.get(level, "INFO ")} {safe}</span>')
         scrollbar = self.console.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -780,34 +736,37 @@ class FTPClientWindow(QMainWindow):
     def toggle_connection(self):
         if self.remote_connected:
             self.req_disconnect.emit()
-            self.log('Disconnected from remote browser', 'info')
+            self.log('Disconnected', 'info')
             return
+        self.connect_remote()
+
+    def connect_remote(self):
         settings = self.connection_settings()
         if not settings.host:
             QMessageBox.warning(self, 'Missing host', 'Please enter the FTP host.')
             return
         self.connect_button.setEnabled(False)
-        self.req_connect.emit(settings)
+        self.req_connect.emit(settings, self.remote_cwd)
 
     def _set_remote_state(self, connected):
         self.remote_connected = connected
         self.connect_button.setEnabled(True)
         self.connect_button.setText('Disconnect' if connected else 'Connect')
         for w in (self.remote_up_button, self.remote_refresh_button, self.remote_mkdir_button,
-                  self.remote_path_edit, self.remote_add_button, self.remote_download_button):
+                  self.remote_path_edit, self.remote_download_button):
             w.setEnabled(connected)
         for w in (self.host_edit, self.port_spin, self.user_edit, self.pass_edit, self.tls_check,
                   self.passive_check, self.encoding_combo):
             w.setEnabled(not connected)
         if not connected:
             self.remote_tree.clear()
+        self.title_changed.emit()
 
     @Slot(str)
     def on_remote_connected(self, cwd):
         self._set_remote_state(True)
-        self.remote_cwd = cwd
-        if not self.remote_dest_edit.text():
-            self.remote_dest_edit.setText(cwd)
+        if not self.remote_cwd:
+            self.remote_cwd = cwd
 
     @Slot(str)
     def on_remote_failed(self, message):
@@ -861,13 +820,6 @@ class FTPClientWindow(QMainWindow):
         return [(it.data(0, Qt.UserRole), bool(it.data(0, Qt.UserRole + 1)))
                 for it in self.remote_tree.selectedItems() if it.data(0, Qt.UserRole + 2) != '..']
 
-    def add_remote_selection(self):
-        items = self.selected_remote_items()
-        if not items:
-            self.log('No remote items selected', 'warning')
-            return
-        self.path_input.add_paths([REMOTE_PREFIX + p for p, _ in items])
-
     def remote_mkdir(self):
         if not self.remote_connected:
             return
@@ -896,23 +848,6 @@ class FTPClientWindow(QMainWindow):
         if answer == QMessageBox.Yes:
             self.req_delete.emit(items, self.remote_cwd)
 
-    def remote_context_menu(self, pos):
-        if not self.remote_connected:
-            return
-        menu = QMenu(self)
-        has_sel = bool(self.selected_remote_items())
-        actions = [('Download (copy)', lambda: self.quick_transfer(DIRECTION_DOWNLOAD, MODE_COPY), has_sel),
-                   ('Download (move)', lambda: self.quick_transfer(DIRECTION_DOWNLOAD, MODE_MOVE), has_sel),
-                   ('Add to input', self.add_remote_selection, has_sel),
-                   None,
-                   ('New folder...', self.remote_mkdir, True),
-                   ('Rename...', self.remote_rename, len(self.selected_remote_items()) == 1),
-                   ('Delete...', self.remote_delete, has_sel),
-                   None,
-                   ('Refresh', self.remote_refresh, True)]
-        self._fill_menu(menu, actions)
-        menu.exec(self.remote_tree.viewport().mapToGlobal(pos))
-
     def _fill_menu(self, menu, actions):
         for entry in actions:
             if entry is None:
@@ -923,6 +858,21 @@ class FTPClientWindow(QMainWindow):
             action.setEnabled(enabled)
             action.triggered.connect(slot)
             menu.addAction(action)
+
+    def remote_context_menu(self, pos):
+        if not self.remote_connected:
+            return
+        menu = QMenu(self)
+        selected = self.selected_remote_items()
+        self._fill_menu(menu, [('Download (copy)', lambda: self.download_selection(MODE_COPY), bool(selected)),
+                               ('Download (move)', lambda: self.download_selection(MODE_MOVE), bool(selected)),
+                               None,
+                               ('New folder...', self.remote_mkdir, True),
+                               ('Rename...', self.remote_rename, len(selected) == 1),
+                               ('Delete...', self.remote_delete, bool(selected)),
+                               None,
+                               ('Refresh', self.remote_refresh, True)])
+        menu.exec(self.remote_tree.viewport().mapToGlobal(pos))
 
     def set_local_dir(self, path):
         path = path.strip()
@@ -954,127 +904,86 @@ class FTPClientWindow(QMainWindow):
         if path:
             self.set_local_dir(path)
 
-    def pick_local_dest(self):
-        path = QFileDialog.getExistingDirectory(self, 'Choose download folder', self.local_dest_edit.text())
-        if path:
-            self.local_dest_edit.setText(QDir.toNativeSeparators(path))
-
-    def pick_input_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, 'Add files', self.local_path_edit.text())
-        if files:
-            self.path_input.add_paths([QDir.toNativeSeparators(f) for f in files])
-
-    def pick_input_folder(self):
-        path = QFileDialog.getExistingDirectory(self, 'Add folder', self.local_path_edit.text())
-        if path:
-            self.path_input.add_paths([QDir.toNativeSeparators(path)])
-
     def local_double_clicked(self, index):
-        path = self.local_model.filePath(index)
         if self.local_model.isDir(index):
-            self.set_local_dir(path)
+            self.set_local_dir(self.local_model.filePath(index))
 
     def selected_local_paths(self):
         return [QDir.toNativeSeparators(self.local_model.filePath(idx))
                 for idx in self.local_view.selectionModel().selectedRows(0)]
 
-    def add_local_selection(self):
-        paths = self.selected_local_paths()
-        if not paths:
-            self.log('No local items selected', 'warning')
-            return
-        self.path_input.add_paths(paths)
-
     def local_context_menu(self, pos):
         menu = QMenu(self)
-        has_sel = bool(self.selected_local_paths())
-        actions = [('Upload (copy)', lambda: self.quick_transfer(DIRECTION_UPLOAD, MODE_COPY), has_sel),
-                   ('Upload (move)', lambda: self.quick_transfer(DIRECTION_UPLOAD, MODE_MOVE), has_sel),
-                   ('Add to input', self.add_local_selection, has_sel)]
-        self._fill_menu(menu, actions)
+        selected = bool(self.selected_local_paths())
+        self._fill_menu(menu, [('Upload (copy)', lambda: self.upload_selection(MODE_COPY), selected),
+                               ('Upload (move)', lambda: self.upload_selection(MODE_MOVE), selected)])
         menu.exec(self.local_view.viewport().mapToGlobal(pos))
 
-    def quick_transfer(self, direction, mode=None):
-        if direction == DIRECTION_UPLOAD:
-            paths = self.selected_local_paths()
-            jobs = [(DIRECTION_UPLOAD, paths, self.remote_dest_edit.text().strip() or self.remote_cwd or '/')]
-        else:
-            paths = [p for p, _ in self.selected_remote_items()]
-            jobs = [(DIRECTION_DOWNLOAD, paths, self.local_dest_edit.text().strip() or self.local_path_edit.text())]
+    def upload_selection(self, mode=None):
+        self.enqueue(DIRECTION_UPLOAD, self.selected_local_paths(), self.remote_cwd or '/', mode)
+
+    def download_selection(self, mode=None):
+        self.enqueue(DIRECTION_DOWNLOAD, [p for p, _ in self.selected_remote_items()],
+                     self.local_path_edit.text(), mode)
+
+    @Slot(object, str)
+    def on_local_dropped(self, paths, target):
+        self.enqueue(DIRECTION_UPLOAD, paths, target or self.remote_cwd or '/')
+
+    @Slot(object, str)
+    def on_remote_dropped(self, items, target):
+        self.enqueue(DIRECTION_DOWNLOAD, [p for p, _ in items], target or self.local_path_edit.text())
+
+    def enqueue(self, direction, paths, destination, mode=None):
         if not paths:
             self.log('Nothing selected', 'warning')
             return
-        self.start_transfer(jobs, mode)
-
-    def build_jobs_from_input(self):
-        lines = parse_path_list(self.path_input.toPlainText())
-        direction = self.direction_combo.currentData()
-        uploads, downloads = [], []
-        for line in lines:
-            is_remote_tagged = line.lower().startswith(REMOTE_PREFIX)
-            path = line[len(REMOTE_PREFIX):].strip() if is_remote_tagged else line
-            if direction == DIRECTION_UPLOAD:
-                uploads.append(path)
-            elif direction == DIRECTION_DOWNLOAD:
-                downloads.append(path)
-            elif is_remote_tagged:
-                downloads.append(path)
-            elif os.path.exists(os.path.expanduser(path)):
-                uploads.append(path)
-            else:
-                self.log(f'"{path}" does not exist locally; treating it as a remote path (download)', 'warning')
-                downloads.append(path)
-        jobs = []
-        if uploads:
-            jobs.append((DIRECTION_UPLOAD, uploads, self.remote_dest_edit.text().strip() or self.remote_cwd or '/'))
-        if downloads:
-            jobs.append((DIRECTION_DOWNLOAD, downloads,
-                         self.local_dest_edit.text().strip() or self.local_path_edit.text() or os.getcwd()))
-        return jobs
-
-    def start_from_input(self):
-        jobs = self.build_jobs_from_input()
-        if not jobs:
-            QMessageBox.information(self, 'Nothing to do', 'Enter at least one file or folder path.')
+        if direction == DIRECTION_UPLOAD and not self.remote_connected:
+            self.log('Connect first: uploads go to the current remote folder', 'warning')
             return
-        self.start_transfer(jobs)
-
-    def start_transfer(self, jobs, mode=None):
-        if self.transfer_worker is not None:
-            QMessageBox.warning(self, 'Busy', 'A transfer is already running.')
-            return
-        settings = self.connection_settings()
-        if not settings.host:
-            QMessageBox.warning(self, 'Missing host', 'Please enter the FTP host.')
+        if direction == DIRECTION_DOWNLOAD and not destination:
+            self.log('Choose a local folder first: downloads go to the current local folder', 'warning')
             return
         options = self.transfer_options(mode)
         if options.mode == MODE_MOVE:
-            count = sum(len(paths) for _, paths, _ in jobs)
             answer = QMessageBox.question(self, 'Confirm move',
-                                          f'MOVE {count} item(s)? Sources are deleted after each successful '
+                                          f'MOVE {len(paths)} item(s)? Sources are deleted after each successful '
                                           f'transfer.')
             if answer != QMessageBox.Yes:
                 return
-        for direction, paths, dest in jobs:
-            arrow = '->' if direction == DIRECTION_UPLOAD else '<-'
-            self.log(f'Queued {direction} ({options.mode}) of {len(paths)} path(s) {arrow} {dest}', 'info')
-        self.log(f'Timeout {settings.timeout:g}s, retries {options.retries}, retry delay {options.retry_delay:g}s, '
+        settings = self.connection_settings()
+        arrow = '->' if direction == DIRECTION_UPLOAD else '<-'
+        self.log(f'Queued {direction} ({options.mode}) of {len(paths)} item(s) {arrow} {destination} | '
+                 f'timeout {settings.timeout:g}s, retries {options.retries}, retry delay {options.retry_delay:g}s, '
                  f'existing files: {options.exists_policy}', 'info')
+        self.queue.append((settings, options, direction, paths, destination))
+        self._start_next()
 
-        self.transfer_worker = TransferWorker(settings, options, jobs)
+    def _start_next(self):
+        self.queue_label.setText(f'Queue: {len(self.queue)}')
+        if self.transfer_worker is not None or not self.queue:
+            return
+        settings, options, direction, paths, destination = self.queue.pop(0)
+        self.queue_label.setText(f'Queue: {len(self.queue)}')
+        self.transfer_worker = TransferWorker(settings, options, direction, paths, destination)
         self.transfer_worker.log.connect(self.log)
         self.transfer_worker.progress.connect(self.on_progress)
         self.transfer_worker.done.connect(self.on_transfer_done)
         self.transfer_worker.finished.connect(self._on_worker_finished)
         self._last_console_progress = 0.0
-        self.start_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.file_progress.setValue(0)
         self.total_progress.setValue(0)
         self.stats_label.setText('Starting ...')
+        self.status_suffix = ' [0%]'
+        self.title_changed.emit()
         self.transfer_worker.start()
 
     def cancel_transfer(self):
+        if self.queue:
+            self.log(f'Dropped {len(self.queue)} queued transfer(s)', 'warning')
+            self.queue.clear()
+            self.queue_label.setText('Queue: 0')
         if self.transfer_worker is not None:
             self.log('Cancelling ...', 'warning')
             self.cancel_button.setEnabled(False)
@@ -1082,8 +991,7 @@ class FTPClientWindow(QMainWindow):
 
     @Slot(object)
     def on_progress(self, info):
-        file_size = info['file_size']
-        total_size = info['total_size']
+        file_size, total_size = info['file_size'], info['total_size']
         file_ratio = info['file_done'] / file_size if file_size else 0
         total_ratio = info['total_done'] / total_size if total_size else 0
         name = os.path.basename(info['file'].replace('\\', '/').rstrip('/')) if info['file'] else '-'
@@ -1094,10 +1002,13 @@ class FTPClientWindow(QMainWindow):
         self.total_progress.setFormat(f'Total: {total_ratio * 100:.1f}%  '
                                       f'({human_size(info["total_done"])} / {human_size(total_size)})')
         speed_text = f'{human_size(info["speed"])}/s'
-        summary = (f'{info.get("job", "")} | file {min(info["files_done"] + 1, info["files_total"])}/'
-                   f'{info["files_total"]} | {speed_text} | ETA {human_time(info["eta"])} | '
-                   f'elapsed {human_time(info["elapsed"])}')
-        self.stats_label.setText(summary)
+        self.stats_label.setText(f'File {min(info["files_done"] + 1, info["files_total"])}/{info["files_total"]} | '
+                                 f'{speed_text} | ETA {human_time(info["eta"])} | '
+                                 f'elapsed {human_time(info["elapsed"])}')
+        suffix = f' [{total_ratio * 100:.0f}%]'
+        if suffix != self.status_suffix:
+            self.status_suffix = suffix
+            self.title_changed.emit()
         now = time.monotonic()
         if info['file'] and now - self._last_console_progress >= self.console_interval_spin.value():
             self._last_console_progress = now
@@ -1106,12 +1017,12 @@ class FTPClientWindow(QMainWindow):
                      f'ETA {human_time(info["eta"])}', 'progress')
 
     @Slot(object)
-    def on_transfer_done(self, totals):
-        level = 'error' if totals['failed'] else ('warning' if totals['cancelled'] else 'success')
-        elapsed = totals.get('elapsed', 0)
-        avg = totals['bytes'] / elapsed if elapsed > 0 else 0
-        message = (f'Transfer {"cancelled" if totals["cancelled"] else "finished"}: {totals["ok"]} ok, '
-                   f'{totals["skipped"]} skipped, {totals["failed"]} failed, {human_size(totals["bytes"])} in '
+    def on_transfer_done(self, stats):
+        level = 'error' if stats['failed'] else ('warning' if stats['cancelled'] else 'success')
+        elapsed = stats.get('elapsed', 0)
+        avg = stats['bytes'] / elapsed if elapsed > 0 else 0
+        message = (f'Transfer {"cancelled" if stats["cancelled"] else "finished"}: {stats["ok"]} ok, '
+                   f'{stats["skipped"]} skipped, {stats["failed"]} failed, {human_size(stats["bytes"])} in '
                    f'{human_time(elapsed)} (avg {human_size(avg)}/s)')
         self.log(message, level)
         self.stats_label.setText(message)
@@ -1119,23 +1030,142 @@ class FTPClientWindow(QMainWindow):
     def _on_worker_finished(self):
         self.transfer_worker.deleteLater()
         self.transfer_worker = None
-        self.start_button.setEnabled(True)
-        self.cancel_button.setEnabled(False)
+        self.cancel_button.setEnabled(bool(self.queue))
+        self.status_suffix = ''
+        self.title_changed.emit()
         if self.remote_connected:
             self.remote_refresh()
+        self._start_next()
 
-    def closeEvent(self, event):
+    def shutdown(self):
+        self.queue.clear()
         if self.transfer_worker is not None:
-            answer = QMessageBox.question(self, 'Transfer running', 'A transfer is running. Cancel it and exit?')
-            if answer != QMessageBox.Yes:
-                event.ignore()
-                return
             self.transfer_worker.cancel()
             self.transfer_worker.wait(15000)
-        save_settings(self._collect_settings())
         self.browser_thread.quit()
         self.browser_thread.wait(5000)
         self.browser_worker.shutdown()
+
+
+class FTPClientWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        data = load_settings()
+        self.setWindowTitle('pyFTPclient V' + read_version())
+        self.resize(1300, 900)
+        icon_path = get_running_path('icon.ico')
+        if os.path.isfile(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+
+        self.tabs = QTabWidget()
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabCloseRequested.connect(self.close_tab)
+        self.tabs.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tabs.tabBar().customContextMenuRequested.connect(self.tab_context_menu)
+        new_tab_button = QToolButton()
+        new_tab_button.setText('+')
+        new_tab_button.setToolTip('New tab, duplicating the current session (Ctrl+T)')
+        new_tab_button.clicked.connect(lambda: self.new_tab(duplicate=True))
+        self.tabs.setCornerWidget(new_tab_button, Qt.TopRightCorner)
+        self.setCentralWidget(self.tabs)
+
+        QShortcut(QKeySequence('Ctrl+T'), self, activated=lambda: self.new_tab(duplicate=True))
+        QShortcut(QKeySequence('Ctrl+W'), self, activated=lambda: self.close_tab(self.tabs.currentIndex()))
+        QShortcut(QKeySequence('F5'), self, activated=lambda: self.current_tab() and self.current_tab().remote_refresh())
+
+        sessions = data.get('sessions') or [{}]
+        for session in sessions:
+            self.add_tab(session)
+        self.tabs.setCurrentIndex(min(int(data.get('current_tab', 0)), self.tabs.count() - 1))
+        geometry = data.get('geometry')
+        if geometry:
+            self.restoreGeometry(QByteArray.fromBase64(geometry.encode('ascii')))
+        self.current_tab().log(f'pyFTPclient V{read_version()} started on {sys.platform}', 'info')
+
+    def current_tab(self):
+        return self.tabs.currentWidget()
+
+    def add_tab(self, settings=None, auto_connect=False):
+        tab = SessionTab(settings)
+        index = self.tabs.addTab(tab, tab.title())
+        tab.title_changed.connect(lambda t=tab: self._update_tab_title(t))
+        self._update_tab_title(tab)
+        self.tabs.setCurrentIndex(index)
+        if auto_connect:
+            tab.connect_remote()
+        return tab
+
+    def new_tab(self, duplicate=False):
+        source = self.current_tab()
+        if duplicate and source is not None:
+            settings = source.collect_settings(include_password=True)
+            settings['tab_name'] = ''
+            tab = self.add_tab(settings, auto_connect=source.remote_connected)
+            tab.log(f'Duplicated from tab "{source.title().strip()}"', 'info')
+        else:
+            self.add_tab({})
+
+    def _update_tab_title(self, tab):
+        index = self.tabs.indexOf(tab)
+        if index < 0:
+            return
+        self.tabs.setTabText(index, tab.title())
+        icon = QStyle.SP_DriveNetIcon if tab.remote_connected else QStyle.SP_ComputerIcon
+        self.tabs.setTabIcon(index, self.style().standardIcon(icon))
+        state = 'connected' if tab.remote_connected else 'not connected'
+        self.tabs.setTabToolTip(index, f'{tab.host_edit.text() or "no host"} ({state})')
+
+    def close_tab(self, index):
+        tab = self.tabs.widget(index)
+        if tab is None:
+            return
+        if tab.is_busy():
+            answer = QMessageBox.question(self, 'Transfer running',
+                                          f'Tab "{tab.title()}" has a running transfer. Cancel it and close the tab?')
+            if answer != QMessageBox.Yes:
+                return
+        tab.shutdown()
+        self.tabs.removeTab(index)
+        tab.deleteLater()
+        if self.tabs.count() == 0:
+            self.add_tab({})
+
+    def rename_tab(self, index):
+        tab = self.tabs.widget(index)
+        name, ok = QInputDialog.getText(self, 'Rename tab', 'Tab name (empty = host name):', text=tab.custom_name)
+        if ok:
+            tab.custom_name = name.strip()
+            self._update_tab_title(tab)
+
+    def tab_context_menu(self, pos):
+        index = self.tabs.tabBar().tabAt(pos)
+        menu = QMenu(self)
+        menu.addAction('New tab (duplicate current)', lambda: self.new_tab(duplicate=True))
+        menu.addAction('New empty tab', lambda: self.new_tab(duplicate=False))
+        if index >= 0:
+            menu.addSeparator()
+            menu.addAction('Rename tab...', lambda: self.rename_tab(index))
+            menu.addAction('Close tab', lambda: self.close_tab(index))
+        menu.exec(self.tabs.tabBar().mapToGlobal(pos))
+
+    def tabs_list(self):
+        return [self.tabs.widget(i) for i in range(self.tabs.count())]
+
+    def closeEvent(self, event):
+        busy = [t.title() for t in self.tabs_list() if t.is_busy()]
+        if busy:
+            answer = QMessageBox.question(self, 'Transfers running',
+                                          f'Transfers are running in: {", ".join(busy)}.\nCancel them and exit?')
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+        save_settings({'geometry': bytes(self.saveGeometry().toBase64()).decode('ascii'),
+                       'current_tab': self.tabs.currentIndex(),
+                       'sessions': [t.collect_settings() for t in self.tabs_list()]})
+        for tab in self.tabs_list():
+            tab.shutdown()
         event.accept()
 
 

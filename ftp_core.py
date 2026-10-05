@@ -126,34 +126,6 @@ def human_time(seconds: Optional[float]) -> str:
     return f'{h:02d}:{m:02d}:{s:02d}'
 
 
-def parse_path_list(text: str) -> List[str]:
-    """Parses a multi-line text into paths. Supports one path per line and multiple quoted paths on a line."""
-    paths = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        quoted = re.findall(r'"([^"]+)"|\'([^\']+)\'', line)
-        if quoted and re.fullmatch(r'(\s*("[^"]+"|\'[^\']+\')\s*)+', line):
-            for double, single in quoted:
-                paths.append((double or single).strip())
-        else:
-            if line.startswith('file://'):
-                from urllib.parse import unquote, urlparse
-                parsed = urlparse(line)
-                line = unquote(parsed.path)
-                if re.match(r'^/[A-Za-z]:/', line):
-                    line = line[1:]
-            paths.append(line)
-    seen = set()
-    unique = []
-    for p in paths:
-        if p not in seen:
-            seen.add(p)
-            unique.append(p)
-    return unique
-
-
 def remote_join(*parts: str) -> str:
     return posixpath.join(*parts)
 

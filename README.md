@@ -1,18 +1,24 @@
 # pyFTPclient
 A cross-platform (Windows + Linux) GUI FTP/FTPS client built with PySide6. Features:
-- side-by-side local and remote file browsers (drag & drop, context menus, new folder / rename / delete on the remote side)
-- a multi-line input box that takes any mix of **files and folders** (one per line, or several `"quoted paths"` on one line)
-  - local paths get uploaded, lines prefixed with `remote:` get downloaded (direction can also be forced)
-  - paths can be typed, pasted, added with file/folder pickers, or dragged from the OS file manager or the browsers
+- **tabs**: every tab is an independent session (own connection, local + remote browsers, options, transfer queue,
+  progress and console), so transfers can run **in parallel**, to the same or to different servers
+  - `+` button / `Ctrl+T` duplicates the current tab (same server, folders and options, auto-connects)
+  - right-click a tab to rename it, open an empty tab or close it; `Ctrl+W` closes the current tab
+  - the tab title shows the progress of the running transfer
+- side-by-side local and remote browsers; files **and** folders (multi-select) can be transferred by:
+  - drag & drop between the two browsers (drop onto a folder to target it), or from the OS file manager
+  - the `Upload selected` / `Download selected` buttons, or the right-click menus
+- remote file management: new folder, rename, delete (recursive)
 - **copy** or **move** (the source is deleted only after a verified successful transfer; emptied folders are cleaned up)
 - configurable **timeout**, **number of retries** and **retry delay**
 - automatic reconnect and **resume** (REST) of partial files on retry
 - policy for existing targets: resume partial / skip identical, overwrite, or skip
 - optional size verification after each file
+- per-tab transfer queue (new transfers wait for the current one in the same tab)
 - console-like log with colored messages, periodic **progress, speed and ETA** lines, save-to-file
 - file and total progress bars with live speed / ETA / elapsed time
 - explicit FTPS (TLS) and active / passive mode support, selectable filename encoding
-- settings persisted in `settings.json` (password only if "Remember" is checked; stored in plain text)
+- all tabs are persisted in `settings.json` (password only if "Remember" is checked; stored in plain text)
 
 # Usage
 - [end-user] Can be used via the bundled executable (available in Releases)
@@ -20,13 +26,3 @@ A cross-platform (Windows + Linux) GUI FTP/FTPS client built with PySide6. Featu
 - [end-user] Linux: run `./Install.sh` and after that `./START_FTPclient.sh`
   - on Debian/Ubuntu Qt may need `sudo apt install libxcb-cursor0 libegl1`
 - [dev] Can be built as an executable by running the install script and after that `BUILD_release.bat` / `./BUILD_release.sh`
-
-# Input box examples
-```
-C:\data\report.pdf
-C:\data\photos
-"D:\a b\one.txt" "D:\a b\two.txt"
-/home/me/backups
-remote:/pub/releases/v1.zip
-remote:/pub/docs
-```
