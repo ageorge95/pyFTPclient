@@ -20,6 +20,8 @@ A cross-platform (Windows + Linux) GUI FTP/FTPS client built with PySide6. Featu
 - explicit FTPS (TLS) and active / passive mode support, selectable filename encoding
 - all tabs are persisted in `settings.json` (password only if "Remember" is checked; stored in plain text)
 
+![](ReadMe_res/GUI_overview.JPG)
+
 # Usage
 - [end-user] Can be used via the bundled executable (available in Releases)
 - [end-user] Windows: run `Install.bat` and after that `START_FTPclient.bat`
