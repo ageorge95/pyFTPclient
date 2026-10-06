@@ -497,25 +497,19 @@ class SessionTab(QWidget):
         self.local_path_edit = QLineEdit()
         self.local_path_edit.returnPressed.connect(lambda: self.set_local_dir(self.local_path_edit.text()))
         nav.addWidget(self._icon_button(QStyle.SP_FileDialogToParent, 'Parent folder', self.local_up))
+        nav.addWidget(self._icon_button(QStyle.SP_BrowserReload, 'Refresh (F5)', self.local_refresh))
         nav.addWidget(self._icon_button(QStyle.SP_DirHomeIcon, 'Home folder',
                                         lambda: self.set_local_dir(os.path.expanduser('~'))))
         nav.addWidget(self.local_path_edit)
         nav.addWidget(self._icon_button(QStyle.SP_DirOpenIcon, 'Pick folder', self.pick_local_dir))
         layout.addLayout(nav)
 
-        self.local_model = QFileSystemModel()
-        self.local_model.setRootPath('')
-        self.local_model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot | QDir.Hidden | QDir.System)
         self.local_view = LocalTree(self.session_id)
-        self.local_view.setModel(self.local_model)
         self.local_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.local_view.setSortingEnabled(True)
-        self.local_view.sortByColumn(0, Qt.AscendingOrder)
         self.local_view.setItemsExpandable(False)
         self.local_view.setRootIsDecorated(False)
-        self.local_view.hideColumn(2)
-        self.local_view.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.local_view.header().setStretchLastSection(False)
+        self._install_local_model(0, Qt.AscendingOrder)
         self.local_view.doubleClicked.connect(self.local_double_clicked)
         self.local_view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.local_view.customContextMenuRequested.connect(self.local_context_menu)
@@ -526,6 +520,19 @@ class SessionTab(QWidget):
         upload_button.clicked.connect(lambda: self.upload_selection())
         layout.addWidget(upload_button)
         return box
+
+    def _install_local_model(self, sort_column, sort_order):
+        old_model = getattr(self, 'local_model', None)
+        self.local_model = QFileSystemModel(self)
+        self.local_model.setRootPath('')
+        self.local_model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot | QDir.Hidden | QDir.System)
+        self.local_view.setModel(self.local_model)
+        self.local_view.sortByColumn(sort_column, sort_order)
+        self.local_view.hideColumn(2)
+        self.local_view.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.local_view.header().setStretchLastSection(False)
+        if old_model is not None:
+            old_model.deleteLater()
 
     def _build_remote_browser(self):
         box = QGroupBox('Remote')
@@ -1014,6 +1021,19 @@ class SessionTab(QWidget):
             return
         self.set_local_dir(parent)
 
+    def refresh_focused(self):
+        focus = QApplication.focusWidget()
+        if focus is not None and (focus is self.local_view or focus is self.local_path_edit
+                                  or self.local_view.isAncestorOf(focus)):
+            self.local_refresh()
+        else:
+            self.remote_refresh()
+
+    def local_refresh(self):
+        header = self.local_view.header()
+        self._install_local_model(header.sortIndicatorSection(), header.sortIndicatorOrder())
+        self.set_local_dir(self.local_path_edit.text())
+
     def pick_local_dir(self):
         path = QFileDialog.getExistingDirectory(self, 'Choose local folder', self.local_path_edit.text())
         if path:
@@ -1031,7 +1051,9 @@ class SessionTab(QWidget):
         menu = QMenu(self)
         selected = bool(self.selected_local_paths())
         self._fill_menu(menu, [('Upload (copy)', lambda: self.upload_selection(MODE_COPY), selected),
-                               ('Upload (move)', lambda: self.upload_selection(MODE_MOVE), selected)])
+                               ('Upload (move)', lambda: self.upload_selection(MODE_MOVE), selected),
+                               None,
+                               ('Refresh', self.local_refresh, True)])
         menu.exec(self.local_view.viewport().mapToGlobal(pos))
 
     def upload_selection(self, mode=None):
@@ -1188,7 +1210,7 @@ class FTPClientWindow(QMainWindow):
 
         QShortcut(QKeySequence('Ctrl+T'), self, activated=lambda: self.new_tab(duplicate=True))
         QShortcut(QKeySequence('Ctrl+W'), self, activated=lambda: self.close_tab(self.tabs.currentIndex()))
-        QShortcut(QKeySequence('F5'), self, activated=lambda: self.current_tab() and self.current_tab().remote_refresh())
+        QShortcut(QKeySequence('F5'), self, activated=lambda: self.current_tab() and self.current_tab().refresh_focused())
 
         sessions = data.get('sessions') or [{}]
         for session in sessions:
