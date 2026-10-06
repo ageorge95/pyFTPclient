@@ -62,7 +62,11 @@ from ftp_core import (ConnectionSettings,
                       list_dir,
                       remote_abspath,
                       remote_rmtree,
+                      remote_join,
+                      remote_disk_usage,
+                      server_supports_df,
                       human_size,
+                      human_gb,
                       human_time,
                       MODE_COPY,
                       MODE_MOVE,
@@ -131,11 +135,14 @@ class RemoteBrowserWorker(QObject):
     failed = Signal(str)
     log = Signal(str, str)
     busy = Signal(bool)
+    disk_usage = Signal(str, object)
+    drives = Signal(object)
 
     def __init__(self):
         super().__init__()
         self.ftp = None
         self.settings = None
+        self.df_supported = False
 
     def _drop(self):
         if self.ftp is not None:
@@ -171,6 +178,31 @@ class RemoteBrowserWorker(QObject):
             return abs_path, list_dir(ftp, abs_path)
         abs_path, entries = self._call(f'Listing {path}', do)
         self.listed.emit(abs_path, entries)
+        self._emit_disk_usage(abs_path)
+
+    def _emit_disk_usage(self, path):
+        usage = None
+        if self.df_supported:
+            try:
+                usage = self._call('Disk usage', lambda ftp: remote_disk_usage(ftp, path))
+            except Exception as e:
+                self.log.emit(f'Cannot read disk usage of {path}: {e}', 'warning')
+        self.disk_usage.emit(path, usage)
+
+    @Slot()
+    def refresh_drives(self):
+        if not self.df_supported or self.settings is None:
+            self.drives.emit(None)
+            return
+
+        def do(ftp):
+            return [(remote_join('/', e.name), remote_disk_usage(ftp, remote_join('/', e.name)))
+                    for e in list_dir(ftp, '/') if e.is_dir]
+        try:
+            self.drives.emit(self._call('Drive usage', do))
+        except Exception as e:
+            self.log.emit(f'Cannot read drive usage: {e}', 'warning')
+            self.drives.emit(None)
 
     @Slot(object, str)
     def connect_to(self, settings, start_path):
@@ -187,10 +219,14 @@ class RemoteBrowserWorker(QObject):
             if welcome:
                 self.log.emit(welcome, 'info')
             cwd = self.ftp.pwd()
+            self.df_supported = server_supports_df(self.ftp)
+            if not self.df_supported:
+                self.log.emit('Server does not support SITE DF: disk space info unavailable', 'info')
             self.log.emit(f'Connected. Remote working directory: {cwd}', 'success')
             self.connected.emit(cwd)
         except Exception as e:
             self.settings = None
+            self.df_supported = False
             self._drop()
             self.failed.emit(f'Connection failed: {e}')
             return
@@ -207,6 +243,7 @@ class RemoteBrowserWorker(QObject):
         safe_close(self.ftp)
         self.ftp = None
         self.settings = None
+        self.df_supported = False
         self.disconnected.emit()
 
     @Slot(str)
@@ -372,6 +409,7 @@ class SessionTab(QWidget):
     req_mkdir = Signal(str, str)
     req_rename = Signal(str, str, str)
     req_delete = Signal(object, str)
+    req_drives = Signal()
 
     def __init__(self, settings=None):
         super().__init__()
@@ -517,10 +555,48 @@ class SessionTab(QWidget):
         self.remote_tree.local_dropped.connect(self.on_local_dropped)
         layout.addWidget(self.remote_tree)
 
+        self.remote_disk_bar = self._make_disk_bar()
+        self.remote_disk_bar.setToolTip('Disk space of the drive holding the current remote folder')
+        layout.addWidget(self.remote_disk_bar)
+
+        self.drives_box = QGroupBox('Drives (root folders)')
+        self.drives_box.setCheckable(True)
+        self.drives_box.setChecked(True)
+        self.drives_container = QWidget()
+        self.drives_layout = QGridLayout(self.drives_container)
+        self.drives_layout.setContentsMargins(0, 0, 0, 0)
+        self.drives_layout.setColumnStretch(1, 1)
+        drives_box_layout = QVBoxLayout(self.drives_box)
+        drives_box_layout.addWidget(self.drives_container)
+        self.drives_box.toggled.connect(self.drives_container.setVisible)
+        layout.addWidget(self.drives_box)
+
         self.remote_download_button = QPushButton('\u2190  Download selected')
         self.remote_download_button.clicked.connect(lambda: self.download_selection())
         layout.addWidget(self.remote_download_button)
         return box
+
+    def _make_disk_bar(self):
+        bar = QProgressBar()
+        bar.setRange(0, 1000)
+        bar.setTextVisible(True)
+        self._set_disk_bar(bar, None, 'Disk space: -')
+        return bar
+
+    @staticmethod
+    def _set_disk_bar(bar, usage, empty_text='Disk space: n/a', prefix=''):
+        if usage is None or usage.total <= 0:
+            bar.setValue(0)
+            bar.setFormat(empty_text)
+            bar.setStyleSheet('')
+            return
+        ratio = usage.used / usage.total
+        color = '#d9534f' if ratio >= 0.9 else ('#f0ad4e' if ratio >= 0.75 else '#5cb85c')
+        bar.setValue(int(min(1.0, ratio) * 1000))
+        bar.setFormat(f'{prefix}{human_gb(usage.used)} / {human_gb(usage.total)} GB used ({ratio * 100:.1f}%)'
+                      f'  |  {human_gb(usage.free)} GB free')
+        bar.setStyleSheet(f'QProgressBar {{ text-align: center; }} '
+                          f'QProgressBar::chunk {{ background-color: {color}; }}')
 
     def _build_transfer_panel(self):
         panel = QWidget()
@@ -634,6 +710,9 @@ class SessionTab(QWidget):
         self.req_mkdir.connect(self.browser_worker.make_dir)
         self.req_rename.connect(self.browser_worker.rename)
         self.req_delete.connect(self.browser_worker.delete)
+        self.req_drives.connect(self.browser_worker.refresh_drives)
+        self.browser_worker.disk_usage.connect(self.on_disk_usage)
+        self.browser_worker.drives.connect(self.on_drives)
         self.browser_worker.connected.connect(self.on_remote_connected)
         self.browser_worker.disconnected.connect(lambda: self._set_remote_state(False))
         self.browser_worker.listed.connect(self.on_remote_listed)
@@ -760,6 +839,8 @@ class SessionTab(QWidget):
             w.setEnabled(not connected)
         if not connected:
             self.remote_tree.clear()
+            self._set_disk_bar(self.remote_disk_bar, None, 'Disk space: -')
+            self.on_drives(None)
         self.title_changed.emit()
 
     @Slot(str)
@@ -767,6 +848,38 @@ class SessionTab(QWidget):
         self._set_remote_state(True)
         if not self.remote_cwd:
             self.remote_cwd = cwd
+        self.req_drives.emit()
+
+    @Slot(str, object)
+    def on_disk_usage(self, path, usage):
+        if path != self.remote_cwd:
+            return
+        if not self.browser_worker.df_supported:
+            empty = 'Disk space: not supported by this server (no SITE DF)'
+        else:
+            empty = f'Disk space: not reported for {path}'
+        self._set_disk_bar(self.remote_disk_bar, usage, empty, prefix=f'{path}:  ')
+
+    @Slot(object)
+    def on_drives(self, drives):
+        while self.drives_layout.count():
+            widget = self.drives_layout.takeAt(0).widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not drives:
+            self.drives_box.setVisible(False)
+            return
+        for row, (path, usage) in enumerate(drives):
+            button = QToolButton()
+            button.setText(posixpath.basename(path) or path)
+            button.setAutoRaise(True)
+            button.setToolTip(f'Open {path}')
+            button.clicked.connect(lambda _checked=False, p=path: self.request_remote_list(p))
+            bar = self._make_disk_bar()
+            self._set_disk_bar(bar, usage, 'not reported')
+            self.drives_layout.addWidget(button, row, 0)
+            self.drives_layout.addWidget(bar, row, 1)
+        self.drives_box.setVisible(True)
 
     @Slot(str)
     def on_remote_failed(self, message):
@@ -811,6 +924,8 @@ class SessionTab(QWidget):
 
     def remote_refresh(self):
         self.request_remote_list(self.remote_cwd or '/')
+        if self.remote_connected:
+            self.req_drives.emit()
 
     def remote_double_clicked(self, item, _column):
         if item.data(0, Qt.UserRole + 1):

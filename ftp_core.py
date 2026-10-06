@@ -53,6 +53,14 @@ class RemoteEntry:
 
 
 @dataclass
+class DiskUsage:
+    total: int
+    used: int
+    free: int
+    path: str = ''
+
+
+@dataclass
 class FileTask:
     src: str
     dst: str
@@ -115,6 +123,10 @@ def human_size(num: float) -> str:
             return f'{num:.0f} {unit}' if unit == 'B' else f'{num:.2f} {unit}'
         num /= 1024
     return f'{num:.2f} TB'
+
+
+def human_gb(num: float) -> str:
+    return f'{num / 1024 ** 3:,.2f}'
 
 
 def human_time(seconds: Optional[float]) -> str:
@@ -226,6 +238,36 @@ def remote_size(ftp: ftplib.FTP, path: str) -> Optional[int]:
         return int(size) if size is not None else None
     except ftplib.error_perm:
         return None
+
+
+_REPLY_ERRORS = (ftplib.error_perm, ftplib.error_temp, ftplib.error_reply, ftplib.error_proto)
+
+
+def server_supports_df(ftp: ftplib.FTP) -> bool:
+    try:
+        resp = ftp.sendcmd('FEAT')
+    except _REPLY_ERRORS:
+        return False
+    return any(' '.join(line.split()).upper() == 'SITE DF' for line in resp.splitlines()[1:])
+
+
+def parse_disk_usage(resp: str) -> Optional[DiskUsage]:
+    if not resp.startswith('213'):
+        return None
+    try:
+        info = dict(kv.split('=', 1) for kv in resp[4:].strip().split(' ', 3))
+        return DiskUsage(total=int(info['total']), used=int(info['used']), free=int(info['free']),
+                         path=info.get('path', ''))
+    except (ValueError, KeyError):
+        return None
+
+
+def remote_disk_usage(ftp: ftplib.FTP, path: str = '') -> Optional[DiskUsage]:
+    try:
+        resp = ftp.sendcmd(f'SITE DF {path}' if path else 'SITE DF')
+    except _REPLY_ERRORS:
+        return None
+    return parse_disk_usage(resp)
 
 
 def remote_makedirs(ftp: ftplib.FTP, path: str):
