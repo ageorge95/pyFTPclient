@@ -425,9 +425,18 @@ class TransferEngine:
             'elapsed': now - self.start_time,
         })
 
+    def _set_task_size(self, task: FileTask, size: Optional[int]):
+        if size is None or size < 0 or size == task.size:
+            return
+        self.total_bytes += size - task.size
+        task.size = size
+
     def _on_chunk(self, nbytes: int):
         self._check_cancel()
         self.current_done += nbytes
+        task = self.current_task
+        if task is not None and self.current_done > task.size:
+            self._set_task_size(task, self.current_done)
         self.meter.add(nbytes)
         self._emit_progress()
 
@@ -539,6 +548,7 @@ class TransferEngine:
         return 0
 
     def _upload_one(self, ftp: ftplib.FTP, task: FileTask, first_attempt: bool) -> bool:
+        self._set_task_size(task, os.path.getsize(task.src))
         existing = remote_size(ftp, task.dst)
         offset = self._resolve_offset(existing, task.size, first_attempt, task.dst)
         if offset is None:
@@ -566,10 +576,7 @@ class TransferEngine:
 
     def _download_one(self, ftp: ftplib.FTP, task: FileTask, first_attempt: bool) -> bool:
         existing = os.path.getsize(task.dst) if os.path.isfile(task.dst) else None
-        if task.size == 0:
-            size = remote_size(ftp, task.src)
-            if size:
-                task.size = size
+        self._set_task_size(task, remote_size(ftp, task.src))
         offset = self._resolve_offset(existing, task.size, first_attempt, task.dst)
         if offset is None:
             return False
