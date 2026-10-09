@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Callable, List, Optional, Tuple
 
 BLOCK_SIZE = 64 * 1024
+RESUME_CHECK_BYTES = 64 * 1024
 
 MODE_COPY = 'copy'
 MODE_MOVE = 'move'
@@ -241,6 +242,31 @@ def remote_size(ftp: ftplib.FTP, path: str) -> Optional[int]:
 
 
 _REPLY_ERRORS = (ftplib.error_perm, ftplib.error_temp, ftplib.error_reply, ftplib.error_proto)
+
+
+def remote_read_range(ftp: ftplib.FTP, path: str, offset: int, length: int) -> bytes:
+    buf = bytearray()
+    ftp.voidcmd('TYPE I')
+    conn = ftp.transfercmd(f'RETR {path}', rest=offset or None)
+    try:
+        while len(buf) < length:
+            chunk = conn.recv(min(BLOCK_SIZE, length - len(buf)))
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        conn.close()
+    try:
+        ftp.voidresp()
+    except _REPLY_ERRORS:
+        pass
+    return bytes(buf)
+
+
+def local_read_range(path: str, offset: int, length: int) -> bytes:
+    with open(path, 'rb') as f:
+        f.seek(offset)
+        return f.read(length)
 
 
 def server_supports_df(ftp: ftplib.FTP) -> bool:
@@ -525,8 +551,13 @@ class TransferEngine:
                 self.stats['failed'] += 1
         return dirs, roots
 
-    def _resolve_offset(self, existing: Optional[int], size: int, first_attempt: bool, label: str) -> Optional[int]:
-        """Returns the resume offset, or None if the file must be skipped."""
+    def _resolve_offset(self, existing: Optional[int], size: int, first_attempt: bool, label: str,
+                        same_data: Callable[[int, int], bool]) -> Optional[int]:
+        """Returns the resume offset, or None if the file must be skipped.
+
+        same_data(offset, length) compares source and destination bytes; a destination that is not a prefix of the
+        source is overwritten instead of being resumed or skipped.
+        """
         if existing is None:
             return 0
         if not first_attempt:
@@ -538,19 +569,31 @@ class TransferEngine:
         if policy == EXISTS_SKIP:
             self.log(f'Exists, skipped: {label}', 'warning')
             return None
-        if policy == EXISTS_RESUME:
+        if policy == EXISTS_RESUME and 0 < existing <= size:
+            check_from = max(0, existing - RESUME_CHECK_BYTES)
+            try:
+                identical = same_data(check_from, existing - check_from)
+            except (OSError, ftplib.error_perm):
+                identical = False
+            if not identical:
+                self.log(f'Existing file differs from source, overwriting: {label}', 'warning')
+                return 0
             if existing == size:
                 self.log(f'Already complete (same size), skipped: {label}', 'warning')
                 return None
-            if 0 < existing < size:
-                self.log(f'Resuming {label} from {human_size(existing)}', 'info')
-                return existing
+            self.log(f'Resuming {label} from {human_size(existing)}', 'info')
+            return existing
         return 0
 
     def _upload_one(self, ftp: ftplib.FTP, task: FileTask, first_attempt: bool) -> bool:
         self._set_task_size(task, os.path.getsize(task.src))
+        expected = task.size
         existing = remote_size(ftp, task.dst)
-        offset = self._resolve_offset(existing, task.size, first_attempt, task.dst)
+
+        def same_data(offset: int, length: int) -> bool:
+            return local_read_range(task.src, offset, length) == remote_read_range(ftp, task.dst, offset, length)
+
+        offset = self._resolve_offset(existing, task.size, first_attempt, task.dst, same_data)
         if offset is None:
             return False
         self.current_done = offset
@@ -570,14 +613,19 @@ class TransferEngine:
                 ftp.storbinary(f'STOR {task.dst}', f, BLOCK_SIZE, lambda b: self._on_chunk(len(b)))
         if self.options.verify_size:
             final = remote_size(ftp, task.dst)
-            if final is not None and final != task.size:
-                raise TransferError(f'size mismatch after upload (remote {final} != local {task.size})')
+            if final is not None and final != expected:
+                raise TransferError(f'size mismatch after upload (remote {final} != local {expected})')
         return True
 
     def _download_one(self, ftp: ftplib.FTP, task: FileTask, first_attempt: bool) -> bool:
         existing = os.path.getsize(task.dst) if os.path.isfile(task.dst) else None
         self._set_task_size(task, remote_size(ftp, task.src))
-        offset = self._resolve_offset(existing, task.size, first_attempt, task.dst)
+        expected = task.size
+
+        def same_data(offset: int, length: int) -> bool:
+            return local_read_range(task.dst, offset, length) == remote_read_range(ftp, task.src, offset, length)
+
+        offset = self._resolve_offset(existing, task.size, first_attempt, task.dst, same_data)
         if offset is None:
             return False
         os.makedirs(os.path.dirname(task.dst) or '.', exist_ok=True)
@@ -587,10 +635,10 @@ class TransferEngine:
                 f.write(chunk)
                 self._on_chunk(len(chunk))
             ftp.retrbinary(f'RETR {task.src}', write, BLOCK_SIZE, rest=offset or None)
-        if self.options.verify_size and task.size:
+        if self.options.verify_size and expected:
             final = os.path.getsize(task.dst)
-            if final != task.size:
-                raise TransferError(f'size mismatch after download (local {final} != remote {task.size})')
+            if final != expected:
+                raise TransferError(f'size mismatch after download (local {final} != remote {expected})')
         return True
 
     def _run_task(self, task: FileTask, direction: str) -> bool:
