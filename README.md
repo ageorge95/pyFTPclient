@@ -10,6 +10,8 @@ A cross-platform (Windows + Linux) GUI FTP/FTPS client built with PySide6. Featu
   - the `Upload selected` / `Download selected` buttons, or the right-click menus
 - remote file management: new folder, rename, delete (recursive)
 - **copy** or **move** (the source is deleted only after a verified successful transfer; emptied folders are cleaned up)
+- **parallel transfers** (default 3, max 8 connections per job): much faster for folders with many small files on
+  high-latency links; if the server refuses extra connections the transfer continues with fewer
 - configurable **timeout**, **number of retries** and **retry delay**
 - automatic reconnect and **resume** (REST) of partial files on retry
 - policy for existing targets: resume partial / skip identical, overwrite, or skip

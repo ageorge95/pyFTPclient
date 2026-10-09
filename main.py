@@ -75,7 +75,9 @@ from ftp_core import (ConnectionSettings,
                       EXISTS_OVERWRITE,
                       EXISTS_SKIP,
                       DIRECTION_UPLOAD,
-                      DIRECTION_DOWNLOAD)
+                      DIRECTION_DOWNLOAD,
+                      MAX_PARALLEL,
+                      DEFAULT_PARALLEL)
 
 SETTINGS_FILE = os.path.abspath('settings.json')
 REMOTE_MIME = 'application/x-pyftpclient-remote-items'
@@ -648,10 +650,19 @@ class SessionTab(QWidget):
         self.console_interval_spin.setToolTip('How often progress lines are printed in the console')
         self.verify_check = QCheckBox('Verify size after transfer')
         self.verify_check.setChecked(True)
+        self.verify_check.setToolTip('Asks the server for the size of every uploaded file (one extra round trip '
+                                     'per file)')
+        self.parallel_spin = QSpinBox()
+        self.parallel_spin.setRange(1, MAX_PARALLEL)
+        self.parallel_spin.setValue(DEFAULT_PARALLEL)
+        self.parallel_spin.setToolTip('Number of simultaneous FTP connections used by one transfer. Speeds up many '
+                                      'small files on high-latency links.\nIf the server refuses extra '
+                                      'connections, the transfer continues with fewer.')
 
         cells = (('Mode:', mode_layout), ('If target exists:', self.exists_combo),
                  ('Timeout:', self.timeout_spin), ('Retries:', self.retries_spin),
-                 ('Retry delay:', self.retry_delay_spin), ('Console progress every:', self.console_interval_spin))
+                 ('Retry delay:', self.retry_delay_spin), ('Console progress every:', self.console_interval_spin),
+                 ('Parallel transfers:', self.parallel_spin))
         for i, (label, widget) in enumerate(cells):
             row, col = divmod(i, 2)
             grid.addWidget(QLabel(label), row, col * 2)
@@ -659,7 +670,7 @@ class SessionTab(QWidget):
                 grid.addLayout(widget, row, col * 2 + 1)
             else:
                 grid.addWidget(widget, row, col * 2 + 1)
-        grid.addWidget(self.verify_check, 3, 0, 1, 4)
+        grid.addWidget(self.verify_check, 3, 2, 1, 2)
         layout.addWidget(options_box, 1)
 
         progress_box = QGroupBox('Progress')
@@ -750,6 +761,7 @@ class SessionTab(QWidget):
         self.retry_delay_spin.setValue(float(s.get('retry_delay', 5)))
         self.console_interval_spin.setValue(float(s.get('console_interval', 2)))
         self.verify_check.setChecked(bool(s.get('verify_size', True)))
+        self.parallel_spin.setValue(int(s.get('parallel', DEFAULT_PARALLEL)))
         (self.move_radio if s.get('mode') == MODE_MOVE else self.copy_radio).setChecked(True)
         idx = self.exists_combo.findData(s.get('exists_policy'))
         if idx >= 0:
@@ -773,6 +785,7 @@ class SessionTab(QWidget):
                 'retry_delay': self.retry_delay_spin.value(),
                 'console_interval': self.console_interval_spin.value(),
                 'verify_size': self.verify_check.isChecked(),
+                'parallel': self.parallel_spin.value(),
                 'mode': MODE_MOVE if self.move_radio.isChecked() else MODE_COPY,
                 'exists_policy': self.exists_combo.currentData(),
                 'local_dir': self.local_path_edit.text(),
@@ -796,7 +809,8 @@ class SessionTab(QWidget):
                                retry_delay=self.retry_delay_spin.value(),
                                mode=mode or (MODE_MOVE if self.move_radio.isChecked() else MODE_COPY),
                                exists_policy=self.exists_combo.currentData(),
-                               verify_size=self.verify_check.isChecked())
+                               verify_size=self.verify_check.isChecked(),
+                               parallel=self.parallel_spin.value())
 
     @Slot(str, str)
     def log(self, message, level='info'):
@@ -1150,7 +1164,7 @@ class SessionTab(QWidget):
         arrow = '->' if direction == DIRECTION_UPLOAD else '<-'
         self.log(f'Queued {direction} ({options.mode}) of {len(paths)} item(s) {arrow} {destination} | '
                  f'timeout {settings.timeout:g}s, retries {options.retries}, retry delay {options.retry_delay:g}s, '
-                 f'existing files: {options.exists_policy}', 'info')
+                 f'existing files: {options.exists_policy}, parallel {options.parallel}', 'info')
         self.queue.append((settings, options, direction, paths, destination))
         self._start_next()
 
@@ -1197,7 +1211,9 @@ class SessionTab(QWidget):
         self.total_progress.setFormat(f'Total: {total_ratio * 100:.1f}%  '
                                       f'({human_size(info["total_done"])} / {human_size(total_size)})')
         speed_text = f'{human_size(info["speed"])}/s'
-        self.stats_label.setText(f'File {min(info["files_done"] + 1, info["files_total"])}/{info["files_total"]} | '
+        active = info.get('active_files', 0)
+        parallel_text = f' ({active} active)' if active > 1 else ''
+        self.stats_label.setText(f'Files {info["files_done"]}/{info["files_total"]} done{parallel_text} | '
                                  f'{speed_text} | ETA {human_time(info["eta"])} | '
                                  f'elapsed {human_time(info["elapsed"])}')
         suffix = f' [{total_ratio * 100:.0f}%]'

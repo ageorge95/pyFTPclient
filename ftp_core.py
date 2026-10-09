@@ -1,6 +1,7 @@
 import ftplib
 import os
 import posixpath
+import queue
 import re
 import threading
 import time
@@ -11,6 +12,10 @@ from typing import Callable, List, Optional, Tuple
 
 BLOCK_SIZE = 64 * 1024
 RESUME_CHECK_BYTES = 64 * 1024
+MAX_PARALLEL = 8
+DEFAULT_PARALLEL = 3
+DST_ABSENT = -1
+LIST_HINT_MIN_FILES = 4
 
 MODE_COPY = 'copy'
 MODE_MOVE = 'move'
@@ -42,6 +47,7 @@ class TransferOptions:
     mode: str = MODE_COPY
     exists_policy: str = EXISTS_RESUME
     verify_size: bool = True
+    parallel: int = DEFAULT_PARALLEL
 
 
 @dataclass
@@ -66,6 +72,8 @@ class FileTask:
     src: str
     dst: str
     size: int
+    size_known: bool = False
+    dst_hint: Optional[int] = None
 
 
 class TransferCancelled(Exception):
@@ -76,7 +84,50 @@ class TransferError(Exception):
     pass
 
 
-class ReusedSessionFTP_TLS(ftplib.FTP_TLS):
+def _is_connection_limit(error: BaseException) -> bool:
+    if not isinstance(error, (ftplib.error_temp, ftplib.error_perm)):
+        return False
+    text = str(error)
+    if text.startswith('421'):
+        return True
+    return text.startswith('530') and any(k in text.lower() for k in ('too many', 'maximum', 'limit'))
+
+
+class _TypeCacheMixin:
+    """Skips redundant TYPE commands (ftplib sends one before every transfer, costing a round trip per file)."""
+
+    _current_type: Optional[str] = None
+
+    @staticmethod
+    def _type_of(cmd: str) -> Optional[str]:
+        parts = cmd.split()
+        if len(parts) == 2 and parts[0].upper() == 'TYPE':
+            return parts[1].upper()
+        return None
+
+    def _typed(self, method, cmd):
+        wanted = self._type_of(cmd)
+        if wanted is None:
+            return method(cmd)
+        if wanted == self._current_type:
+            return '200 Type already set.'
+        self._current_type = None
+        resp = method(cmd)
+        self._current_type = wanted
+        return resp
+
+    def sendcmd(self, cmd):
+        return self._typed(super().sendcmd, cmd)
+
+    def voidcmd(self, cmd):
+        return self._typed(super().voidcmd, cmd)
+
+
+class CachedTypeFTP(_TypeCacheMixin, ftplib.FTP):
+    pass
+
+
+class ReusedSessionFTP_TLS(_TypeCacheMixin, ftplib.FTP_TLS):
     """FTP_TLS that reuses the control connection TLS session on data connections (required by many servers)."""
 
     def ntransfercmd(self, cmd, rest=None):
@@ -92,7 +143,7 @@ def connect(settings: ConnectionSettings) -> ftplib.FTP:
     if settings.use_tls:
         ftp = ReusedSessionFTP_TLS(timeout=settings.timeout, encoding=settings.encoding)
     else:
-        ftp = ftplib.FTP(timeout=settings.timeout, encoding=settings.encoding)
+        ftp = CachedTypeFTP(timeout=settings.timeout, encoding=settings.encoding)
     try:
         ftp.connect(settings.host, int(settings.port))
         ftp.login(settings.user or 'anonymous', settings.password or '')
@@ -235,6 +286,7 @@ def list_dir(ftp: ftplib.FTP, path: str) -> List[RemoteEntry]:
 
 def remote_size(ftp: ftplib.FTP, path: str) -> Optional[int]:
     try:
+        ftp.voidcmd('TYPE I')
         size = ftp.size(path)
         return int(size) if size is not None else None
     except ftplib.error_perm:
@@ -296,24 +348,68 @@ def remote_disk_usage(ftp: ftplib.FTP, path: str = '') -> Optional[DiskUsage]:
     return parse_disk_usage(resp)
 
 
-def remote_makedirs(ftp: ftplib.FTP, path: str):
-    path = posixpath.normpath(path)
-    if path in ('/', '.', ''):
-        return
+def remote_makedirs_many(ftp: ftplib.FTP, paths: List[str]) -> set:
+    """Creates the given absolute remote folders (and parents) and returns the set of folders that were created.
+
+    Every folder costs one round trip: CWD to probe an existing folder, or a direct MKD under a freshly created parent.
+    """
+    known: set = set()
+    created: set = set()
+
+    def ensure(path: str):
+        if path in known or path in ('/', '.', ''):
+            return
+        parent = posixpath.dirname(path)
+        if parent in created:
+            ftp.mkd(path)
+            created.add(path)
+        else:
+            try:
+                ftp.cwd(path)
+            except ftplib.error_perm:
+                if parent and parent != path:
+                    ensure(parent)
+                ftp.mkd(path)
+                created.add(path)
+            else:
+                ancestor = parent
+                while ancestor and ancestor not in known and ancestor != posixpath.dirname(ancestor):
+                    known.add(ancestor)
+                    ancestor = posixpath.dirname(ancestor)
+        known.add(path)
+
     current = ftp.pwd()
     try:
-        built = '/' if path.startswith('/') else ''
-        for part in [p for p in path.split('/') if p]:
-            built = posixpath.join(built, part) if built else part
-            try:
-                ftp.cwd(built)
-            except ftplib.error_perm:
-                ftp.mkd(built)
+        for p in paths:
+            ensure(posixpath.normpath(p))
     finally:
         try:
             ftp.cwd(current)
         except ftplib.all_errors:
             pass
+    return created
+
+
+def remote_makedirs(ftp: ftplib.FTP, path: str):
+    remote_makedirs_many(ftp, [path])
+
+
+def remote_file_sizes(ftp: ftplib.FTP, path: str) -> Optional[dict]:
+    """Maps the entry names of a remote folder to file sizes with one MLSD (None if MLSD is not supported).
+
+    Entries whose size is not reliable (folders, links, no size fact) map to None.
+    """
+    result = {}
+    try:
+        for name, facts in ftp.mlsd(path, facts=['type', 'size']):
+            kind = facts.get('type', '').lower()
+            if kind in ('cdir', 'pdir') or name in ('.', '..'):
+                continue
+            size = facts.get('size')
+            result[name] = int(size) if kind == 'file' and size else None
+    except (ftplib.error_perm, ValueError):
+        return None
+    return result
 
 
 def remote_rmtree(ftp: ftplib.FTP, path: str, log: Optional[Callable[[str, str], None]] = None):
@@ -356,8 +452,25 @@ LogCallback = Callable[[str, str], None]
 ProgressCallback = Callable[[dict], None]
 
 
+class _Conn:
+    """One FTP control connection, owned by one thread at a time."""
+
+    def __init__(self, number: int):
+        self.number = number
+        self.ftp: Optional[ftplib.FTP] = None
+
+
+class _ConnectionRefused(Exception):
+    """The server refused an additional parallel connection; the worker retires and gives its file back."""
+
+
 class TransferEngine:
-    """Runs uploads/downloads with retries, resume, progress, speed and ETA reporting. Not thread-safe; use one per job."""
+    """Runs uploads/downloads with retries, resume, progress, speed and ETA reporting.
+
+    Files are transferred by up to options.parallel workers, each with its own FTP connection. If the server refuses
+    an extra connection (e.g. "421 too many connections"), that worker retires and the others continue.
+    Use one engine per job.
+    """
 
     def __init__(self,
                  settings: ConnectionSettings,
@@ -372,18 +485,25 @@ class TransferEngine:
         self.progress = progress
         self.cancel_event = cancel_event or threading.Event()
         self.progress_interval = progress_interval
-        self.ftp: Optional[ftplib.FTP] = None
+        self.main = _Conn(1)
 
         self.tasks: List[FileTask] = []
         self.total_bytes = 0
         self.completed_bytes = 0
         self.files_done = 0
-        self.current_task: Optional[FileTask] = None
-        self.current_done = 0
         self.meter = SpeedMeter()
         self.start_time = 0.0
         self._last_progress = 0.0
         self.stats = {'ok': 0, 'skipped': 0, 'failed': 0, 'bytes': 0}
+
+        self._lock = threading.RLock()
+        self._pending: deque = deque()
+        self._active = {}
+        self._alive = 0
+
+    @property
+    def ftp(self) -> Optional[ftplib.FTP]:
+        return self.main.ftp
 
     def _check_cancel(self):
         if self.cancel_event.is_set():
@@ -395,33 +515,48 @@ class TransferEngine:
             self._check_cancel()
             time.sleep(min(0.1, max(0.0, end - time.monotonic())))
 
-    def _ensure_connected(self) -> ftplib.FTP:
-        if self.ftp is None:
-            self.log(f'Connecting to {self.settings.host}:{self.settings.port} ...', 'info')
-            self.ftp = connect(self.settings)
-        return self.ftp
-
-    def _drop_connection(self):
-        if self.ftp is not None:
+    def _ensure_connected(self, conn: _Conn, task: Optional[FileTask] = None) -> ftplib.FTP:
+        """Connects if needed. With a task, a refused extra connection retires this worker (when other workers are
+        still running): the task is handed back to the queue and _ConnectionRefused is raised."""
+        if conn.ftp is None:
+            suffix = f' (connection #{conn.number})' if self.options.parallel > 1 else ''
+            self.log(f'Connecting to {self.settings.host}:{self.settings.port}{suffix} ...', 'info')
             try:
-                self.ftp.close()
+                conn.ftp = connect(self.settings)
+            except ftplib.all_errors as e:
+                if task is not None and _is_connection_limit(e):
+                    with self._lock:
+                        if self._alive > 1:
+                            self._alive -= 1
+                            self._active.pop(conn.number, None)
+                            self._pending.appendleft(task)
+                            raise _ConnectionRefused(str(e).strip())
+                raise
+        return conn.ftp
+
+    @staticmethod
+    def _drop_connection(conn: _Conn):
+        if conn.ftp is not None:
+            try:
+                conn.ftp.close()
             except Exception:
                 pass
-        self.ftp = None
+        conn.ftp = None
 
-    def _with_reconnect(self, description: str, func):
+    def _with_reconnect(self, description: str, func, conn: Optional[_Conn] = None):
+        conn = conn or self.main
         attempt = 0
         while True:
             self._check_cancel()
             try:
-                return func(self._ensure_connected())
+                return func(self._ensure_connected(conn))
             except TransferCancelled:
                 raise
             except ftplib.error_perm:
                 raise
             except ftplib.all_errors as e:
                 attempt += 1
-                self._drop_connection()
+                self._drop_connection(conn)
                 if attempt > self.options.retries:
                     raise
                 self.log(f'{description} failed ({e!r}); retry {attempt}/{self.options.retries} '
@@ -429,41 +564,57 @@ class TransferEngine:
                 self._sleep(self.options.retry_delay)
 
     def _emit_progress(self, force: bool = False):
-        now = time.monotonic()
-        if not force and now - self._last_progress < self.progress_interval:
-            return
-        self._last_progress = now
-        speed = self.meter.speed()
-        total_done = self.completed_bytes + self.current_done
-        remaining = max(0, self.total_bytes - total_done)
-        eta = remaining / speed if speed > 0 else None
-        task = self.current_task
-        self.progress({
-            'file': task.src if task else '',
-            'file_done': self.current_done,
-            'file_size': task.size if task else 0,
-            'total_done': total_done,
-            'total_size': self.total_bytes,
-            'files_done': self.files_done,
-            'files_total': len(self.tasks),
-            'speed': speed,
-            'eta': eta,
-            'elapsed': now - self.start_time,
-        })
+        with self._lock:
+            now = time.monotonic()
+            if not force and now - self._last_progress < self.progress_interval:
+                return
+            self._last_progress = now
+            speed = self.meter.speed()
+            active = [(task, done) for task, done in self._active.values() if task is not None]
+            in_flight = sum(done for _, done in active)
+            total_done = self.completed_bytes + in_flight
+            remaining = max(0, self.total_bytes - total_done)
+            eta = remaining / speed if speed > 0 else None
+            shown = max(active, key=lambda a: a[0].size - a[1], default=None)
+            info = {
+                'file': shown[0].src if shown else '',
+                'file_done': shown[1] if shown else 0,
+                'file_size': shown[0].size if shown else 0,
+                'active_files': len(active),
+                'connections': self._alive,
+                'total_done': total_done,
+                'total_size': self.total_bytes,
+                'files_done': self.files_done,
+                'files_total': len(self.tasks),
+                'speed': speed,
+                'eta': eta,
+                'elapsed': now - self.start_time,
+            }
+        self.progress(info)
 
     def _set_task_size(self, task: FileTask, size: Optional[int]):
-        if size is None or size < 0 or size == task.size:
-            return
-        self.total_bytes += size - task.size
-        task.size = size
+        with self._lock:
+            if size is None or size < 0:
+                return
+            task.size_known = True
+            if size == task.size:
+                return
+            self.total_bytes += size - task.size
+            task.size = size
 
-    def _on_chunk(self, nbytes: int):
+    def _set_done(self, conn: _Conn, task: FileTask, done: int):
+        with self._lock:
+            self._active[conn.number] = (task, done)
+
+    def _on_chunk(self, conn: _Conn, nbytes: int):
         self._check_cancel()
-        self.current_done += nbytes
-        task = self.current_task
-        if task is not None and self.current_done > task.size:
-            self._set_task_size(task, self.current_done)
-        self.meter.add(nbytes)
+        with self._lock:
+            task, done = self._active[conn.number]
+            done += nbytes
+            self._active[conn.number] = (task, done)
+            if done > task.size:
+                self._set_task_size(task, done)
+            self.meter.add(nbytes)
         self._emit_progress()
 
     def _plan_upload(self, local_paths: List[str], remote_dest: str) -> Tuple[List[str], List[str]]:
@@ -473,7 +624,7 @@ class TransferEngine:
             path = os.path.abspath(os.path.expanduser(raw))
             if os.path.isfile(path):
                 size = os.path.getsize(path)
-                self.tasks.append(FileTask(path, remote_join(remote_dest, os.path.basename(path)), size))
+                self.tasks.append(FileTask(path, remote_join(remote_dest, os.path.basename(path)), size, True))
             elif os.path.isdir(path):
                 base = os.path.basename(os.path.normpath(path)) or 'root'
                 remote_root = remote_join(remote_dest, base)
@@ -493,11 +644,37 @@ class TransferEngine:
                             self.log(f'Cannot read {local_file}: {e}', 'error')
                             self.stats['failed'] += 1
                             continue
-                        self.tasks.append(FileTask(local_file, remote_join(remote_dir, name), size))
+                        self.tasks.append(FileTask(local_file, remote_join(remote_dir, name), size, True))
             else:
                 self.log(f'Local path not found, skipped: {raw}', 'error')
                 self.stats['failed'] += 1
         return dirs, roots
+
+    def _prepare_remote_dirs(self, ftp: ftplib.FTP, remote_dest: str, dirs: List[str]):
+        """Creates the remote folders and pre-fills destination hints, so files need no per-file SIZE probe:
+        files in a freshly created folder cannot exist, folders that already existed are listed once (MLSD)."""
+        created = remote_makedirs_many(ftp, [remote_dest] + dirs)
+        if self.options.exists_policy == EXISTS_OVERWRITE:
+            return
+        by_dir = {}
+        for task in self.tasks:
+            by_dir.setdefault(posixpath.dirname(task.dst), []).append(task)
+        for folder, tasks in by_dir.items():
+            self._check_cancel()
+            if posixpath.normpath(folder) in created:
+                for task in tasks:
+                    task.dst_hint = DST_ABSENT
+            elif len(tasks) >= LIST_HINT_MIN_FILES:
+                sizes = remote_file_sizes(ftp, folder)
+                if sizes is None:
+                    continue
+                lowered = {name.lower() for name in sizes}
+                for task in tasks:
+                    name = posixpath.basename(task.dst)
+                    if name in sizes:
+                        task.dst_hint = sizes[name]
+                    elif name.lower() not in lowered:
+                        task.dst_hint = DST_ABSENT
 
     def _walk_remote(self, ftp: ftplib.FTP, remote_root: str, local_root: str, dirs: List[str]):
         dirs.append(local_root)
@@ -507,9 +684,11 @@ class TransferEngine:
             local_path = os.path.join(local_root, entry.name)
             if entry.is_dir:
                 self._walk_remote(ftp, remote_path, local_path, dirs)
+            elif entry.size and not entry.is_link:
+                self.tasks.append(FileTask(remote_path, local_path, entry.size, True))
             else:
-                size = entry.size if entry.size else (remote_size(ftp, remote_path) or 0)
-                self.tasks.append(FileTask(remote_path, local_path, size))
+                size = remote_size(ftp, remote_path)
+                self.tasks.append(FileTask(remote_path, local_path, size or 0, size is not None))
 
     def _plan_download(self, remote_paths: List[str], local_dest: str) -> Tuple[List[str], List[str]]:
         dirs: List[str] = []
@@ -540,8 +719,8 @@ class TransferEngine:
                             self.log(f'Remote path not found, skipped: {raw}', 'error')
                             self.stats['failed'] += 1
                             return
-                        size = 0
-                    self.tasks.append(FileTask(path, os.path.join(local_dest, posixpath.basename(path)), size))
+                    self.tasks.append(FileTask(path, os.path.join(local_dest, posixpath.basename(path)), size or 0,
+                                               size is not None))
             try:
                 self._with_reconnect(f'Scanning {raw}', plan)
             except TransferCancelled:
@@ -585,10 +764,20 @@ class TransferEngine:
             return existing
         return 0
 
-    def _upload_one(self, ftp: ftplib.FTP, task: FileTask, first_attempt: bool) -> bool:
+    def _remote_existing(self, ftp: ftplib.FTP, task: FileTask, first_attempt: bool) -> Optional[int]:
+        if first_attempt:
+            if self.options.exists_policy == EXISTS_OVERWRITE:
+                return None
+            if task.dst_hint == DST_ABSENT:
+                return None
+            if task.dst_hint is not None:
+                return task.dst_hint
+        return remote_size(ftp, task.dst)
+
+    def _upload_one(self, conn: _Conn, ftp: ftplib.FTP, task: FileTask, first_attempt: bool) -> bool:
         self._set_task_size(task, os.path.getsize(task.src))
         expected = task.size
-        existing = remote_size(ftp, task.dst)
+        existing = self._remote_existing(ftp, task, first_attempt)
 
         def same_data(offset: int, length: int) -> bool:
             return local_read_range(task.src, offset, length) == remote_read_range(ftp, task.dst, offset, length)
@@ -596,31 +785,36 @@ class TransferEngine:
         offset = self._resolve_offset(existing, task.size, first_attempt, task.dst, same_data)
         if offset is None:
             return False
-        self.current_done = offset
+        self._set_done(conn, task, offset)
+
+        def on_block(block: bytes):
+            self._on_chunk(conn, len(block))
+
         with open(task.src, 'rb') as f:
             f.seek(offset)
             if offset:
                 try:
-                    ftp.storbinary(f'STOR {task.dst}', f, BLOCK_SIZE, lambda b: self._on_chunk(len(b)), rest=offset)
+                    ftp.storbinary(f'STOR {task.dst}', f, BLOCK_SIZE, on_block, rest=offset)
                 except ftplib.error_perm as e:
                     if not str(e).startswith(('500', '501', '502', '504')):
                         raise
                     self.log('Server rejected REST for STOR, falling back to APPE', 'warning')
                     f.seek(offset)
-                    self.current_done = offset
-                    ftp.storbinary(f'APPE {task.dst}', f, BLOCK_SIZE, lambda b: self._on_chunk(len(b)))
+                    self._set_done(conn, task, offset)
+                    ftp.storbinary(f'APPE {task.dst}', f, BLOCK_SIZE, on_block)
             else:
-                ftp.storbinary(f'STOR {task.dst}', f, BLOCK_SIZE, lambda b: self._on_chunk(len(b)))
+                ftp.storbinary(f'STOR {task.dst}', f, BLOCK_SIZE, on_block)
         if self.options.verify_size:
             final = remote_size(ftp, task.dst)
             if final is not None and final != expected:
                 raise TransferError(f'size mismatch after upload (remote {final} != local {expected})')
         return True
 
-    def _download_one(self, ftp: ftplib.FTP, task: FileTask, first_attempt: bool) -> bool:
+    def _download_one(self, conn: _Conn, ftp: ftplib.FTP, task: FileTask, first_attempt: bool) -> bool:
         existing = os.path.getsize(task.dst) if os.path.isfile(task.dst) else None
-        self._set_task_size(task, remote_size(ftp, task.src))
-        expected = task.size
+        if not (first_attempt and task.size_known):
+            self._set_task_size(task, remote_size(ftp, task.src))
+        expected = task.size if task.size_known else 0
 
         def same_data(offset: int, length: int) -> bool:
             return local_read_range(task.dst, offset, length) == remote_read_range(ftp, task.src, offset, length)
@@ -629,11 +823,11 @@ class TransferEngine:
         if offset is None:
             return False
         os.makedirs(os.path.dirname(task.dst) or '.', exist_ok=True)
-        self.current_done = offset
+        self._set_done(conn, task, offset)
         with open(task.dst, 'ab' if offset else 'wb') as f:
             def write(chunk: bytes):
                 f.write(chunk)
-                self._on_chunk(len(chunk))
+                self._on_chunk(conn, len(chunk))
             ftp.retrbinary(f'RETR {task.src}', write, BLOCK_SIZE, rest=offset or None)
         if self.options.verify_size and expected:
             final = os.path.getsize(task.dst)
@@ -641,28 +835,128 @@ class TransferEngine:
                 raise TransferError(f'size mismatch after download (local {final} != remote {expected})')
         return True
 
-    def _run_task(self, task: FileTask, direction: str) -> bool:
+    def _run_task(self, conn: _Conn, task: FileTask, direction: str) -> bool:
         attempt = 0
         while True:
             self._check_cancel()
-            self.current_done = 0
+            self._set_done(conn, task, 0)
             try:
-                ftp = self._ensure_connected()
+                ftp = self._ensure_connected(conn, task)
                 if direction == DIRECTION_UPLOAD:
-                    return self._upload_one(ftp, task, attempt == 0)
-                return self._download_one(ftp, task, attempt == 0)
-            except TransferCancelled:
+                    return self._upload_one(conn, ftp, task, attempt == 0)
+                return self._download_one(conn, ftp, task, attempt == 0)
+            except (TransferCancelled, _ConnectionRefused):
                 raise
             except ftplib.error_perm as e:
                 raise TransferError(f'permanent server error: {e}')
             except (TransferError, *ftplib.all_errors) as e:
                 attempt += 1
-                self._drop_connection()
+                self._drop_connection(conn)
                 if attempt > self.options.retries:
                     raise TransferError(f'giving up after {self.options.retries} retries: {e}')
                 self.log(f'Error on {posixpath.basename(task.src.replace(os.sep, "/"))}: {e!r}; '
                          f'retry {attempt}/{self.options.retries} in {self.options.retry_delay:g}s', 'warning')
                 self._sleep(self.options.retry_delay)
+
+    def _next_task(self) -> Optional[FileTask]:
+        with self._lock:
+            if self._pending and not self.cancel_event.is_set():
+                return self._pending.popleft()
+            self._alive -= 1
+            return None
+
+    def _finish_task(self, conn: _Conn, task: FileTask, transferred: Optional[bool], direction: str,
+                     started: float):
+        if transferred:
+            elapsed = max(time.monotonic() - started, 1e-6)
+            with self._lock:
+                self.stats['ok'] += 1
+                self.stats['bytes'] += task.size
+            self.log(f'Done {task.src} -> {task.dst} ({human_size(task.size)} in {human_time(elapsed)}, '
+                     f'avg {human_size(task.size / elapsed)}/s)', 'success')
+            if self.options.mode == MODE_MOVE:
+                try:
+                    if direction == DIRECTION_UPLOAD:
+                        os.remove(task.src)
+                    else:
+                        self._with_reconnect('Deleting remote source', lambda ftp: ftp.delete(task.src), conn)
+                except TransferCancelled:
+                    raise
+                except Exception as e:
+                    self.log(f'Transferred but could not delete source {task.src}: {e}', 'warning')
+        elif transferred is False:
+            with self._lock:
+                self.stats['skipped'] += 1
+        with self._lock:
+            self.completed_bytes += task.size
+            self.files_done += 1
+            self._active.pop(conn.number, None)
+        self._emit_progress(force=True)
+
+    def _worker(self, conn: _Conn, direction: str):
+        while True:
+            task = self._next_task()
+            if task is None:
+                return
+            started = time.monotonic()
+            try:
+                transferred = self._run_task(conn, task, direction)
+            except _ConnectionRefused as e:
+                self.log(f'Server refused connection #{conn.number} ({e}); continuing with fewer connections',
+                         'warning')
+                return
+            except TransferCancelled:
+                with self._lock:
+                    self._active.pop(conn.number, None)
+                    self._alive -= 1
+                return
+            except TransferError as e:
+                self.log(f'FAILED {task.src}: {e}', 'error')
+                with self._lock:
+                    self.stats['failed'] += 1
+                transferred = None
+            except Exception as e:
+                self.log(f'FAILED {task.src}: {e!r}', 'error')
+                with self._lock:
+                    self.stats['failed'] += 1
+                transferred = None
+            try:
+                self._finish_task(conn, task, transferred, direction, started)
+            except TransferCancelled:
+                with self._lock:
+                    self._alive -= 1
+                return
+
+    def _transfer_all(self, direction: str):
+        workers = max(1, min(int(self.options.parallel or 1), MAX_PARALLEL, len(self.tasks)))
+        conns = [self.main] + [_Conn(i + 1) for i in range(1, workers)]
+        self._pending = deque(self.tasks)
+        self._alive = workers
+        if workers > 1:
+            self.log(f'Using {workers} parallel connections', 'info')
+        threads = [threading.Thread(target=self._worker, args=(c, direction), daemon=True,
+                                    name=f'ftp-transfer-{c.number}') for c in conns[1:]]
+        try:
+            for t in threads:
+                t.start()
+            self._worker(self.main, direction)
+        finally:
+            for t in threads:
+                while t.is_alive():
+                    t.join(0.2)
+            for c in conns[1:]:
+                if self.cancel_event.is_set():
+                    self._drop_connection(c)
+                else:
+                    safe_close(c.ftp)
+                    c.ftp = None
+        self._check_cancel()
+        with self._lock:
+            leftover = list(self._pending)
+            self._pending.clear()
+        for task in leftover:
+            self.log(f'FAILED {task.src}: no connection available', 'error')
+            self.stats['failed'] += 1
 
     def _cleanup_after_move(self, direction: str, roots: List[str]):
         for root in roots:
@@ -710,8 +1004,8 @@ class TransferEngine:
                 self.log(f'{verb} {len(paths)} local path(s) to remote {remote_dest}', 'info')
                 dirs, roots = self._plan_upload(paths, remote_dest)
                 if dirs or self.tasks:
-                    self._with_reconnect('Creating remote folders', lambda ftp: [remote_makedirs(ftp, d) for d in
-                                                                                 ([remote_dest] + dirs)])
+                    self._with_reconnect('Creating remote folders',
+                                         lambda ftp: self._prepare_remote_dirs(ftp, remote_dest, dirs))
             else:
                 local_dest = os.path.abspath(os.path.expanduser(destination))
                 self.log(f'{verb} {len(paths)} remote path(s) to local {local_dest}', 'info')
@@ -724,40 +1018,8 @@ class TransferEngine:
             self.log(f'{len(self.tasks)} file(s), {human_size(self.total_bytes)} total', 'info')
             self._emit_progress(force=True)
 
-            for task in self.tasks:
-                self._check_cancel()
-                self.current_task = task
-                self.current_done = 0
-                started = time.monotonic()
-                try:
-                    transferred = self._run_task(task, direction)
-                except TransferError as e:
-                    self.log(f'FAILED {task.src}: {e}', 'error')
-                    self.stats['failed'] += 1
-                    transferred = None
-                if transferred:
-                    elapsed = max(time.monotonic() - started, 1e-6)
-                    self.stats['ok'] += 1
-                    self.stats['bytes'] += task.size
-                    self.log(f'Done {task.src} -> {task.dst} ({human_size(task.size)} in {human_time(elapsed)}, '
-                             f'avg {human_size(task.size / elapsed)}/s)', 'success')
-                    if mode == MODE_MOVE:
-                        try:
-                            if direction == DIRECTION_UPLOAD:
-                                os.remove(task.src)
-                            else:
-                                self._with_reconnect('Deleting remote source', lambda ftp: ftp.delete(task.src))
-                        except TransferCancelled:
-                            raise
-                        except Exception as e:
-                            self.log(f'Transferred but could not delete source {task.src}: {e}', 'warning')
-                elif transferred is False:
-                    self.stats['skipped'] += 1
-                self.completed_bytes += task.size
-                self.current_task = None
-                self.current_done = 0
-                self.files_done += 1
-                self._emit_progress(force=True)
+            if self.tasks:
+                self._transfer_all(direction)
 
             if mode == MODE_MOVE and roots:
                 self._cleanup_after_move(direction, roots)
@@ -771,9 +1033,9 @@ class TransferEngine:
             self.stats['failed'] += 1
         finally:
             if self.stats.get('cancelled'):
-                self._drop_connection()
+                self._drop_connection(self.main)
             else:
-                safe_close(self.ftp)
-                self.ftp = None
+                safe_close(self.main.ftp)
+                self.main.ftp = None
         self.stats['elapsed'] = time.monotonic() - self.start_time
         return self.stats
