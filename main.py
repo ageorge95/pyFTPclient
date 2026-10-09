@@ -1365,8 +1365,14 @@ class FTPClientWindow(QMainWindow):
 
 
 if __name__ == '__main__':
+    if sys.platform == 'win32':
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('pyFTPclient.app')
     app = QApplication(sys.argv)
     app.setApplicationName('pyFTPclient')
+    app_icon_path = get_running_path('icon.ico')
+    if os.path.isfile(app_icon_path):
+        app.setWindowIcon(QIcon(app_icon_path))
     window = FTPClientWindow()
     window.show()
     sys.exit(app.exec())
