@@ -4,6 +4,7 @@ import json
 import html
 import time
 import ftplib
+import shutil
 import posixpath
 import threading
 import itertools
@@ -1049,12 +1050,69 @@ class SessionTab(QWidget):
 
     def local_context_menu(self, pos):
         menu = QMenu(self)
-        selected = bool(self.selected_local_paths())
+        paths = self.selected_local_paths()
+        selected = bool(paths)
+        has_dir = bool(self.local_path_edit.text())
         self._fill_menu(menu, [('Upload (copy)', lambda: self.upload_selection(MODE_COPY), selected),
                                ('Upload (move)', lambda: self.upload_selection(MODE_MOVE), selected),
                                None,
+                               ('New folder...', self.local_mkdir, has_dir),
+                               ('Rename...', self.local_rename, len(paths) == 1),
+                               ('Delete...', self.local_delete, selected),
+                               None,
                                ('Refresh', self.local_refresh, True)])
         menu.exec(self.local_view.viewport().mapToGlobal(pos))
+
+    def local_mkdir(self):
+        base = self.local_path_edit.text()
+        if not base:
+            return
+        name, ok = QInputDialog.getText(self, 'New local folder', 'Folder name:')
+        if not (ok and name.strip()):
+            return
+        target = os.path.join(base, name.strip())
+        try:
+            os.makedirs(target)
+            self.log(f'Created local folder {target}', 'success')
+        except OSError as exc:
+            self.log(f'Cannot create local folder {target}: {exc}', 'error')
+
+    def local_rename(self):
+        paths = self.selected_local_paths()
+        if len(paths) != 1:
+            return
+        path = os.path.normpath(paths[0])
+        old_name = os.path.basename(path)
+        name, ok = QInputDialog.getText(self, 'Rename', 'New name:', text=old_name)
+        if not (ok and name.strip()) or name.strip() == old_name:
+            return
+        target = os.path.join(os.path.dirname(path), name.strip())
+        try:
+            os.rename(path, target)
+            self.log(f'Renamed {path} -> {target}', 'success')
+        except OSError as exc:
+            self.log(f'Cannot rename {path}: {exc}', 'error')
+
+    def local_delete(self):
+        paths = self.selected_local_paths()
+        if not paths:
+            return
+        listing = '\n'.join(p + (os.sep if os.path.isdir(p) else '') for p in paths[:15])
+        if len(paths) > 15:
+            listing += f'\n... and {len(paths) - 15} more'
+        answer = QMessageBox.question(self, 'Delete local items',
+                                      f'Permanently delete {len(paths)} item(s) (folders recursively)?\n\n{listing}')
+        if answer != QMessageBox.Yes:
+            return
+        for path in paths:
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+                self.log(f'Deleted {path}', 'success')
+            except OSError as exc:
+                self.log(f'Cannot delete {path}: {exc}', 'error')
 
     def upload_selection(self, mode=None):
         self.enqueue(DIRECTION_UPLOAD, self.selected_local_paths(), self.remote_cwd or '/', mode)
