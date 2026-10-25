@@ -1,5 +1,6 @@
 import sys
 import os
+import ctypes
 import json
 import html
 import time
@@ -80,6 +81,9 @@ from ftp_core import (ConnectionSettings,
                       DEFAULT_PARALLEL)
 
 SETTINGS_FILE = os.path.abspath('settings.json')
+
+APP_ID = 'AG95.pyFTPclient'
+ICON_FILE = 'icon.ico'
 REMOTE_MIME = 'application/x-pyftpclient-remote-items'
 
 LOG_COLORS = {'info': '#d4d4d4',
@@ -95,6 +99,16 @@ _session_ids = itertools.count(1)
 def get_running_path(relative_path):
     base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative_path)
+
+
+def set_windows_app_id():
+    """Give the app its own Windows taskbar identity."""
+    if sys.platform != 'win32':
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except (AttributeError, OSError):
+        pass
 
 
 def read_version():
@@ -1381,12 +1395,10 @@ class FTPClientWindow(QMainWindow):
 
 
 if __name__ == '__main__':
-    if sys.platform == 'win32':
-        import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('pyFTPclient.app')
+    set_windows_app_id()
     app = QApplication(sys.argv)
     app.setApplicationName('pyFTPclient')
-    app_icon_path = get_running_path('icon.ico')
+    app_icon_path = get_running_path(ICON_FILE)
     if os.path.isfile(app_icon_path):
         app.setWindowIcon(QIcon(app_icon_path))
     window = FTPClientWindow()

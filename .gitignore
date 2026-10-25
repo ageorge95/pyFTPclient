@@ -5,3 +5,5 @@ __pycache__/
 /activate.bat
 /activate
 /settings.json
+/activate.ps1
+/activate.sh

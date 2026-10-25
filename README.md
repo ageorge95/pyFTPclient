@@ -26,7 +26,7 @@ A cross-platform (Windows + Linux) GUI FTP/FTPS client built with PySide6. Featu
 
 # Usage
 - [end-user] Can be used via the bundled executable (available in Releases)
-- [end-user] Windows: run `Install.bat` and after that `START_FTPclient.bat`
-- [end-user] Linux: run `./Install.sh` and after that `./START_FTPclient.sh`
+- [end-user] Windows: run `powershell -ExecutionPolicy Bypass -File _install\install.ps1` and after that `START_FTPclient.bat`
+- [end-user] Linux: run `./_install/install.sh` and after that `./START_FTPclient.sh`
   - on Debian/Ubuntu Qt may need `sudo apt install libxcb-cursor0 libegl1`
-- [dev] Can be built as an executable by running the install script and after that `BUILD_release.bat` / `./BUILD_release.sh`
+- [dev] Can be built as an executable with PyInstaller from `main.py`
