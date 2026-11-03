@@ -1,28 +1,31 @@
 #!/usr/bin/env bash
-# VERSION=2
+# VERSION=3
 # https://github.com/ageorge95/ag95_repo_base
 #
 # Generic installer: creates a Python virtual environment for this repository
-# and installs its requirements.
+# with uv and installs its requirements.
 #
 # Copy this file (together with update.sh and pip.ini) into the root of a
 # repository or into an '_install' or '_install_templates' folder inside it,
 # and adapt the CONFIGURATION section below. Nothing else should need changing.
 #
+# The requested Python version does NOT have to be installed on the system:
+# uv downloads a standalone Python build when no matching interpreter is found.
+#
 # Steps:
-#   1. Find the highest installed Python that is not excluded
-#      (or use the one given with --python).
+#   1. Find uv (PATH or the uv install folder); install it if missing.
 #   2. Optionally update Git submodules.
 #   3. Optionally create symlinks.
-#   4. (Re)create the virtual environment, copy pip.ini into it and install
-#      the requirements with uv (using the indexes from pip.ini).
+#   4. (Re)create the virtual environment with 'uv venv' using the requested
+#      Python version (downloaded by uv if needed), copy pip.ini into it and
+#      install the requirements with uv (using the indexes from pip.ini).
 #   5. Optionally install the repository itself in editable mode.
 #
 # Usage:
-#   ./install.sh [--python <path-or-command>] [--no-pause]
+#   ./install.sh [--python <version-or-path>] [--no-pause]
 #
-#   --python    Python interpreter to use instead of auto-detection.
-#               The exclusion list still applies.
+#   --python    Python to use instead of PYTHON_VERSION. Anything uv
+#               understands: '3.11', '3.12.4', '>=3.10,<3.13' or a path.
 #   --no-pause  Do not wait for Enter before exiting (CI / scripting).
 
 set -eo pipefail
@@ -48,13 +51,37 @@ APP_NAME="$(basename "$REPO_ROOT")"
 # Virtual environment folder, relative to the repository root.
 VENV_DIR="venv"
 
-# Python versions that must NOT be used. The highest remaining version is used.
-#   "3.12"   excludes every 3.12.x
-#   "3.12.1" excludes only 3.12.1
-# Examples:
-#   INCOMPATIBLE_PYTHON=("3.8" "3.9")
-#   INCOMPATIBLE_PYTHON=("3.13" "3.14" "3.15")
-INCOMPATIBLE_PYTHON=("2.7" "3.6" "3.7" "3.8")
+# Allowed Python versions for the virtual environment (uv version request).
+# uv first uses a matching Python that is already available (uv-managed ones
+# first, newest first; then installed ones, first match found). If none
+# matches, uv downloads the newest stable version inside the range
+# (no root rights needed).
+#   ">=3.10,<3.14"   any 3.10.x - 3.13.x
+#   ">=3.10,!=3.12.1,<3.14"   same, but never 3.12.1
+#   "3.12"           only 3.12.x
+#   "3.12.4"         exactly 3.12.4
+PYTHON_VERSION=">=3.14,<3.15"
+
+# Which Pythons uv may use:
+#   managed       prefer uv-managed (downloaded) Pythons, but also use installed ones
+#   only-managed  always use a uv-managed Python (same build on every machine)
+#   system        prefer installed Pythons, download only if none matches
+#   only-system   never download, only use installed Pythons
+PYTHON_PREFERENCE="managed"
+
+# Optional mirror for the Python downloads (for networks without GitHub access).
+# Passed to uv as UV_PYTHON_INSTALL_MIRROR. Empty = uv default.
+PYTHON_INSTALL_MIRROR=""
+
+# Set to true to install uv automatically when it's not found.
+AUTO_INSTALL_UV=true
+
+# Where uv is installed when it's missing (shared by all repositories).
+# Shell profiles are NOT modified; the scripts also look here.
+UV_INSTALL_DIR="$HOME/.local/bin"
+
+# Official uv installer. Pin a version with e.g. "https://astral.sh/uv/0.9.0/install.sh".
+UV_INSTALLER_URL="https://astral.sh/uv/install.sh"
 
 # Set to true to run 'git submodule update --init --recursive --force'.
 UPDATE_SUBMODULES=false
@@ -99,7 +126,7 @@ while [ $# -gt 0 ]; do
         --python)    PYTHON_ARG="${2:-}"; shift 2 || { echo "ERROR: --python needs a value" >&2; exit 2; } ;;
         --python=*)  PYTHON_ARG="${1#*=}"; shift ;;
         --no-pause)  NO_PAUSE=true; shift ;;
-        -h|--help)   sed -n '4,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)   sed -n '4,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)           echo "ERROR: unknown argument '$1' (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -137,59 +164,45 @@ python_version() {
     "$1" -c "import sys; print('%d.%d.%d' % sys.version_info[:3])" 2>/dev/null | tail -n 1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true
 }
 
-is_excluded() {
-    local full="$1" short="${1%.*}" entry
-    for entry in ${INCOMPATIBLE_PYTHON[@]+"${INCOMPATIBLE_PYTHON[@]}"}; do
-        if [ "$entry" = "$short" ] || [ "$entry" = "$full" ]; then return 0; fi
-    done
-    return 1
-}
-
 abs_path() {
     # Absolute path of an existing file, symlinks in the directory part resolved.
     echo "$(cd "$(dirname "$1")" && pwd -P)/$(basename "$1")"
 }
 
-# Searches PATH for python, python3 and python3.X; prints the best one.
-find_python() {
-    local IFS_SAVE="$IFS" dir exe ver venv_abs list="" best=""
-    venv_abs="$REPO_ROOT/$VENV_DIR"
-
-    IFS=":"
-    for dir in $PATH; do
-        IFS="$IFS_SAVE"
-        [ -d "$dir" ] || continue
-        for exe in "$dir"/python "$dir"/python3 "$dir"/python3.[0-9]*; do
-            [ -f "$exe" ] && [ -x "$exe" ] || continue
-            case "$exe" in *-config|*m-config|*-dbg) continue ;; esac
-            # Never use a virtual environment's interpreter.
-            case "$exe" in "$venv_abs"/*) continue ;; esac
-            if [ -n "${VIRTUAL_ENV:-}" ]; then
-                case "$exe" in "$VIRTUAL_ENV"/*) continue ;; esac
-            fi
-            [ -f "$(dirname "$dir")/pyvenv.cfg" ] && continue
-            ver="$(python_version "$exe")"
-            [ -n "$ver" ] || continue
-            list="${list}${ver} ${exe}"$'\n'
-        done
-        IFS=":"
+# Prints the path of an existing uv executable, or nothing.
+find_uv() {
+    local dir
+    if command -v uv >/dev/null 2>&1; then command -v uv; return 0; fi
+    for dir in "$UV_INSTALL_DIR" "$HOME/.cargo/bin"; do
+        if [ -x "$dir/uv" ]; then echo "$dir/uv"; return 0; fi
+        if [ -f "$dir/uv.exe" ]; then echo "$dir/uv.exe"; return 0; fi
     done
-    IFS="$IFS_SAVE"
+}
 
-    [ -n "$list" ] || return 0
+# Runs the official standalone installer without touching shell profiles.
+install_uv() {
+    echo "uv was not found, installing it into $UV_INSTALL_DIR..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -LsSf "$UV_INSTALLER_URL" | env UV_INSTALL_DIR="$UV_INSTALL_DIR" UV_NO_MODIFY_PATH=1 sh
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$UV_INSTALLER_URL" | env UV_INSTALL_DIR="$UV_INSTALL_DIR" UV_NO_MODIFY_PATH=1 sh
+    else
+        die "Neither curl nor wget was found, cannot install uv. Install uv manually (https://docs.astral.sh/uv/getting-started/installation/)."
+    fi
+}
 
-    # Sort by version (highest first), print the table, pick the first allowed one.
-    while read -r ver exe; do
-        [ -n "$ver" ] || continue
-        if is_excluded "$ver"; then
-            printf '  %-8s %-9s %s\n' "$ver" "excluded" "$exe" >&2
-        else
-            printf '  %-8s %-9s %s\n' "$ver" "ok" "$exe" >&2
-            [ -n "$best" ] || best="$exe"
-        fi
-    done < <(printf '%s' "$list" | sort -u | sort -t. -k1,1nr -k2,2nr -k3,3nr)
-
-    echo "$best"
+# Finds or installs uv and stores its path in UV.
+UV=""
+get_uv() {
+    step "Looking for uv..."
+    UV="$(find_uv)"
+    if [ -z "$UV" ]; then
+        [ "$AUTO_INSTALL_UV" = true ] || die "uv was not found. Install it (https://docs.astral.sh/uv/getting-started/installation/) or set AUTO_INSTALL_UV=true."
+        install_uv
+        UV="$(find_uv)"
+        [ -n "$UV" ] || die "uv was installed but was not found in $UV_INSTALL_DIR."
+    fi
+    echo "${C_GREEN}Using $("$UV" --version) : $UV${C_OFF}"
 }
 
 update_submodules() {
@@ -281,15 +294,24 @@ copy_pip_config() {
     if [ -d "$venv/Scripts" ]; then cp -f "$PIP_CONFIG_PATH" "$venv/pip.ini"; else cp -f "$PIP_CONFIG_PATH" "$venv/pip.conf"; fi
 }
 
-install_tools() {
-    step "Upgrading pip and installing uv..."
-    "$1" -m pip install --upgrade pip uv
+# Creates the venv with the requested Python; uv downloads it if it's not installed.
+# --seed puts pip into the venv, so plain 'pip' / 'python -m pip' keep working.
+create_venv() {
+    local request="${PYTHON_ARG:-$PYTHON_VERSION}" label="the default Python"
+    [ -n "$request" ] && label="Python $request"
+    step "Creating the virtual environment ($VENV_DIR) with $label..."
+    echo "uv downloads this Python if no matching installation is found."
+
+    local args=(venv "$VENV_DIR" --seed --python-preference "$PYTHON_PREFERENCE")
+    [ -n "$request" ] && args+=(--python "$request")
+    read_uv_index_args
+    "$UV" "${args[@]}" ${UV_INDEX_ARGS[@]+"${UV_INDEX_ARGS[@]}"}
 }
 
 uv_pip_install() {
     local venv_python="$1"; shift
     read_uv_index_args
-    "$venv_python" -m uv pip install --python "$venv_python" "$@" ${UV_INDEX_ARGS[@]+"${UV_INDEX_ARGS[@]}"}
+    "$UV" pip install --python "$venv_python" "$@" ${UV_INDEX_ARGS[@]+"${UV_INDEX_ARGS[@]}"}
 }
 
 install_requirements() {
@@ -321,28 +343,11 @@ install_editable() {
 # ============================================================
 
 echo "${C_GREEN}Installing $APP_NAME${C_OFF}"
-if [ ${#INCOMPATIBLE_PYTHON[@]} -gt 0 ]; then
-    echo "Excluded Python versions: ${INCOMPATIBLE_PYTHON[*]}"
-fi
 check_pip_config   # fail early, before anything is changed
+if [ -n "$PYTHON_INSTALL_MIRROR" ]; then export UV_PYTHON_INSTALL_MIRROR="$PYTHON_INSTALL_MIRROR"; fi
 
-# --- Python selection ---
-if [ -n "$PYTHON_ARG" ]; then
-    step "Checking the requested Python ($PYTHON_ARG)..."
-    PYTHON_EXE="$(command -v "$PYTHON_ARG" 2>/dev/null || true)"
-    [ -n "$PYTHON_EXE" ] || die "Python '$PYTHON_ARG' was not found."
-    PY_VERSION="$(python_version "$PYTHON_EXE")"
-    [ -n "$PY_VERSION" ] || die "'$PYTHON_EXE' does not look like a working Python interpreter."
-    if is_excluded "$PY_VERSION"; then
-        die "Python $PY_VERSION is excluded for $APP_NAME (excluded: ${INCOMPATIBLE_PYTHON[*]})."
-    fi
-else
-    step "Searching for a compatible Python installation..."
-    PYTHON_EXE="$(find_python)"
-    [ -n "$PYTHON_EXE" ] || die "No compatible Python installation was found. Install a supported Python version or pass --python <path>."
-    PY_VERSION="$(python_version "$PYTHON_EXE")"
-fi
-echo "${C_GREEN}Selected Python $PY_VERSION : $PYTHON_EXE${C_OFF}"
+# --- uv ---
+get_uv
 
 # --- Submodules and links ---
 update_submodules
@@ -357,10 +362,7 @@ if [ -e "$VENV_DIR" ]; then
     rm -rf "$VENV_DIR"
 fi
 
-step "Creating the virtual environment ($VENV_DIR)..."
-if ! "$PYTHON_EXE" -m venv "$VENV_DIR"; then
-    die "Could not create the virtual environment. On Debian/Ubuntu install the venv package first, e.g. 'sudo apt install python${PY_VERSION%.*}-venv'."
-fi
+create_venv || die "Could not create the virtual environment."
 
 # Linux/macOS use bin/, Python on Windows (Git Bash) uses Scripts/.
 if [ -x "$VENV_DIR/bin/python" ]; then
@@ -372,6 +374,9 @@ elif [ -f "$VENV_DIR/Scripts/python.exe" ]; then
 else
     die "Virtual environment Python not found in $VENV_DIR."
 fi
+PY_VERSION="$(python_version "$VENV_PYTHON")"
+[ -n "$PY_VERSION" ] || die "The virtual environment's Python is not working: $VENV_PYTHON"
+echo "${C_GREEN}Virtual environment Python $PY_VERSION${C_OFF}"
 
 # activate.sh in the repository root (symlink to the venv's activate script).
 # The activate script stores the venv path itself, so sourcing the symlink works.
@@ -380,7 +385,6 @@ ln -s "$VENV_BIN/activate" activate.sh 2>/dev/null || cp "$VENV_BIN/activate" ac
 
 # --- Packages ---
 copy_pip_config "$VENV_DIR"
-install_tools "$VENV_PYTHON"
 install_requirements "$VENV_PYTHON" false
 install_editable "$VENV_PYTHON"
 

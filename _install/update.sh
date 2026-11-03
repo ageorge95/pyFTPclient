@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VERSION=2
+# VERSION=3
 # https://github.com/ageorge95/ag95_repo_base
 #
 # Generic updater: updates the packages of this repository's existing
@@ -10,11 +10,12 @@
 # sync with install.sh.
 #
 # Steps:
-#   1. Optionally update Git submodules.
-#   2. Optionally recreate symlinks.
-#   3. Copy pip.ini into the virtual environment, upgrade pip/uv and upgrade
+#   1. Find uv (PATH or the uv install folder); install it if missing.
+#   2. Optionally update Git submodules.
+#   3. Optionally recreate symlinks.
+#   4. Copy pip.ini into the virtual environment, upgrade pip and upgrade
 #      the requirements with uv (using the indexes from pip.ini).
-#   4. Optionally reinstall the repository itself in editable mode.
+#   5. Optionally reinstall the repository itself in editable mode.
 #
 # Run install.sh first if the virtual environment does not exist yet.
 #
@@ -46,11 +47,21 @@ APP_NAME="$(basename "$REPO_ROOT")"
 # Virtual environment folder, relative to the repository root.
 VENV_DIR="venv"
 
-# Python versions that must NOT be used. Only used here to warn if the
-# existing virtual environment was built with an excluded version.
-#   "3.12"   excludes every 3.12.x
-#   "3.12.1" excludes only 3.12.1
-INCOMPATIBLE_PYTHON=("2.7" "3.6" "3.7" "3.8")
+# Allowed Python versions (same value as in install.sh). Used here to stop if
+# the existing virtual environment's Python is outside the range.
+#   ">=3.10,<3.14"   any 3.10.x - 3.13.x
+#   "3.12"           only 3.12.x
+PYTHON_VERSION=">=3.14,<3.15"
+
+# Set to true to install uv automatically when it's not found.
+AUTO_INSTALL_UV=true
+
+# Where uv is installed when it's missing (shared by all repositories).
+# Shell profiles are NOT modified; the scripts also look here.
+UV_INSTALL_DIR="$HOME/.local/bin"
+
+# Official uv installer. Pin a version with e.g. "https://astral.sh/uv/0.9.0/install.sh".
+UV_INSTALLER_URL="https://astral.sh/uv/install.sh"
 
 # Set to true to run 'git submodule update --init --recursive --force'.
 UPDATE_SUBMODULES=false
@@ -90,7 +101,7 @@ NO_PAUSE=false
 while [ $# -gt 0 ]; do
     case "$1" in
         --no-pause)  NO_PAUSE=true; shift ;;
-        -h|--help)   sed -n '4,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)   sed -n '4,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)           echo "ERROR: unknown argument '$1' (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -128,12 +139,50 @@ python_version() {
     "$1" -c "import sys; print('%d.%d.%d' % sys.version_info[:3])" 2>/dev/null | tail -n 1 | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true
 }
 
-is_excluded() {
-    local full="$1" short="${1%.*}" entry
-    for entry in ${INCOMPATIBLE_PYTHON[@]+"${INCOMPATIBLE_PYTHON[@]}"}; do
-        if [ "$entry" = "$short" ] || [ "$entry" = "$full" ]; then return 0; fi
+# Asks the venv's Python whether it is inside PYTHON_VERSION, using the
+# 'packaging' copy bundled with pip. A bare version like "3.12" means "3.12.*".
+# Prints True, False, or nothing when the check can't be done.
+PYTHON_RANGE_CHECK="import re,sys; from pip._vendor.packaging.specifiers import SpecifierSet as S; r=sys.argv[1].strip(); r=('=='+r+'.*') if re.fullmatch(r'\d+(\.\d+)?',r) else ('=='+r) if re.fullmatch(r'\d+\.\d+\.\d+',r) else r; print(S(r).contains('%d.%d.%d' % sys.version_info[:3], prereleases=True))"
+
+python_in_range() {
+    if [ -z "$PYTHON_VERSION" ]; then echo True; return 0; fi
+    "$1" -c "$PYTHON_RANGE_CHECK" "$PYTHON_VERSION" 2>/dev/null | tail -n 1 | tr -d '\r' | grep -E '^(True|False)$' || true
+}
+
+# Prints the path of an existing uv executable, or nothing.
+find_uv() {
+    local dir
+    if command -v uv >/dev/null 2>&1; then command -v uv; return 0; fi
+    for dir in "$UV_INSTALL_DIR" "$HOME/.cargo/bin"; do
+        if [ -x "$dir/uv" ]; then echo "$dir/uv"; return 0; fi
+        if [ -f "$dir/uv.exe" ]; then echo "$dir/uv.exe"; return 0; fi
     done
-    return 1
+}
+
+# Runs the official standalone installer without touching shell profiles.
+install_uv() {
+    echo "uv was not found, installing it into $UV_INSTALL_DIR..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -LsSf "$UV_INSTALLER_URL" | env UV_INSTALL_DIR="$UV_INSTALL_DIR" UV_NO_MODIFY_PATH=1 sh
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$UV_INSTALLER_URL" | env UV_INSTALL_DIR="$UV_INSTALL_DIR" UV_NO_MODIFY_PATH=1 sh
+    else
+        die "Neither curl nor wget was found, cannot install uv. Install uv manually (https://docs.astral.sh/uv/getting-started/installation/)."
+    fi
+}
+
+# Finds or installs uv and stores its path in UV.
+UV=""
+get_uv() {
+    step "Looking for uv..."
+    UV="$(find_uv)"
+    if [ -z "$UV" ]; then
+        [ "$AUTO_INSTALL_UV" = true ] || die "uv was not found. Install it (https://docs.astral.sh/uv/getting-started/installation/) or set AUTO_INSTALL_UV=true."
+        install_uv
+        UV="$(find_uv)"
+        [ -n "$UV" ] || die "uv was installed but was not found in $UV_INSTALL_DIR."
+    fi
+    echo "${C_GREEN}Using $("$UV" --version) : $UV${C_OFF}"
 }
 
 update_submodules() {
@@ -225,15 +274,16 @@ copy_pip_config() {
     if [ -d "$venv/Scripts" ]; then cp -f "$PIP_CONFIG_PATH" "$venv/pip.ini"; else cp -f "$PIP_CONFIG_PATH" "$venv/pip.conf"; fi
 }
 
-install_tools() {
-    step "Upgrading pip and installing uv..."
-    "$1" -m pip install --upgrade pip uv
-}
-
 uv_pip_install() {
     local venv_python="$1"; shift
     read_uv_index_args
-    "$venv_python" -m uv pip install --python "$venv_python" "$@" ${UV_INDEX_ARGS[@]+"${UV_INDEX_ARGS[@]}"}
+    "$UV" pip install --python "$venv_python" "$@" ${UV_INDEX_ARGS[@]+"${UV_INDEX_ARGS[@]}"}
+}
+
+# Keeps the venv's own pip current, so plain 'pip' inside the venv keeps working.
+update_pip() {
+    step "Upgrading pip..."
+    uv_pip_install "$1" --upgrade pip
 }
 
 install_requirements() {
@@ -279,15 +329,19 @@ fi
 PY_VERSION="$(python_version "$VENV_PYTHON")"
 [ -n "$PY_VERSION" ] || die "The virtual environment's Python is not working. Run install.sh to recreate it."
 echo "Virtual environment Python $PY_VERSION"
-if is_excluded "$PY_VERSION"; then
-    warn "WARNING: Python $PY_VERSION is excluded for $APP_NAME. Run install.sh to recreate the virtual environment."
-fi
+case "$(python_in_range "$VENV_PYTHON")" in
+    True)  ;;
+    False) die "Python $PY_VERSION is outside the allowed range '$PYTHON_VERSION' for $APP_NAME. Run install.sh to recreate the virtual environment." ;;
+    *)     warn "WARNING: could not check Python $PY_VERSION against '$PYTHON_VERSION' (pip missing from the venv?)." ;;
+esac
+
+get_uv
 
 update_submodules
 create_links
 
 copy_pip_config "$VENV_DIR"
-install_tools "$VENV_PYTHON"
+update_pip "$VENV_PYTHON"
 install_requirements "$VENV_PYTHON" true
 install_editable "$VENV_PYTHON"
 

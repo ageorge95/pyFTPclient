@@ -29,4 +29,5 @@ A cross-platform (Windows + Linux) GUI FTP/FTPS client built with PySide6. Featu
 - [end-user] Windows: run `powershell -ExecutionPolicy Bypass -File _install\install.ps1` and after that `START_FTPclient.bat`
 - [end-user] Linux: run `./_install/install.sh` and after that `./START_FTPclient.sh`
   - on Debian/Ubuntu Qt may need `sudo apt install libxcb-cursor0 libegl1`
+- [end-user] The install scripts use [uv](https://docs.astral.sh/uv/) (installed automatically into `~/.local/bin` if missing) and Python 3.14, which uv downloads if it is not already installed
 - [dev] Can be built as an executable with PyInstaller from `main.py`

@@ -1,10 +1,10 @@
-# VERSION=2
+# VERSION=3
 # https://github.com/ageorge95/ag95_repo_base
 
 <#
 .SYNOPSIS
     Generic installer: creates a Python virtual environment for this repository
-    and installs its requirements.
+    with uv and installs its requirements.
 
 .DESCRIPTION
     Copy this file (together with update.ps1 and pip.ini) into the root of a
@@ -12,25 +12,29 @@
     and adapt the CONFIGURATION section below. Nothing else should need
     changing.
 
+    The requested Python version does NOT have to be installed on the system:
+    uv downloads a standalone Python build when no matching interpreter is found.
+
     Steps:
-      1. Find the highest installed Python that is not excluded
-         (or use the one given with -Python).
+      1. Find uv (PATH or the uv install folder); install it if missing.
       2. Optionally update Git submodules.
       3. Optionally create directory/file links.
-      4. (Re)create the virtual environment, copy pip.ini into it and install
-         the requirements with uv (using the indexes from pip.ini).
+      4. (Re)create the virtual environment with 'uv venv' using the requested
+         Python version (downloaded by uv if needed), copy pip.ini into it and
+         install the requirements with uv (using the indexes from pip.ini).
       5. Optionally install the repository itself in editable mode.
 
 .PARAMETER Python
-    Python interpreter to use instead of auto-detection (path or command name).
-    The exclusion list still applies.
+    Python to use instead of $PYTHON_VERSION. Anything uv understands:
+    a version ('3.11', '3.12.4', '>=3.10,<3.13') or an interpreter path.
 
 .PARAMETER NoPause
     Do not wait for Enter before exiting (useful for CI / scripting).
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File install.ps1
-    powershell -ExecutionPolicy Bypass -File install.ps1 -Python C:\Python311\python.exe -NoPause
+    powershell -ExecutionPolicy Bypass -File install.ps1 -Python 3.11 -NoPause
+    powershell -ExecutionPolicy Bypass -File install.ps1 -Python C:\Python311\python.exe
 #>
 [CmdletBinding()]
 param(
@@ -58,13 +62,37 @@ $APP_NAME = Split-Path -Leaf $REPO_ROOT
 # Virtual environment folder, relative to the repository root.
 $VENV_DIR = 'venv'
 
-# Python versions that must NOT be used. The highest remaining version is used.
-#   '3.12'   excludes every 3.12.x
-#   '3.12.1' excludes only 3.12.1
-# Examples:
-#   $INCOMPATIBLE_PYTHON = @('3.8', '3.9')
-#   $INCOMPATIBLE_PYTHON = @('3.13', '3.14', '3.15')
-$INCOMPATIBLE_PYTHON = @('2.7', '3.6', '3.7', '3.8')
+# Allowed Python versions for the virtual environment (uv version request).
+# uv first uses a matching Python that is already available (uv-managed ones
+# first, newest first; then installed ones, first match found). If none
+# matches, uv downloads the newest stable version inside the range
+# (no admin rights needed).
+#   '>=3.10,<3.14'   any 3.10.x - 3.13.x
+#   '>=3.10,!=3.12.1,<3.14'   same, but never 3.12.1
+#   '3.12'           only 3.12.x
+#   '3.12.4'         exactly 3.12.4
+$PYTHON_VERSION = '>=3.14,<3.15'
+
+# Which Pythons uv may use:
+#   'managed'       prefer uv-managed (downloaded) Pythons, but also use installed ones
+#   'only-managed'  always use a uv-managed Python (same build on every machine)
+#   'system'        prefer installed Pythons, download only if none matches
+#   'only-system'   never download, only use installed Pythons
+$PYTHON_PREFERENCE = 'managed'
+
+# Optional mirror for the Python downloads (for networks without GitHub access).
+# Passed to uv as UV_PYTHON_INSTALL_MIRROR. Empty = uv default.
+$PYTHON_INSTALL_MIRROR = ''
+
+# Set to $true to install uv automatically when it's not found.
+$AUTO_INSTALL_UV = $true
+
+# Where uv is installed when it's missing (shared by all repositories).
+# The user PATH is NOT modified; the scripts also look here.
+$UV_INSTALL_DIR = Join-Path $HOME '.local\bin'
+
+# Official uv installer. Pin a version with e.g. 'https://astral.sh/uv/0.9.0/install.ps1'.
+$UV_INSTALLER_URL = 'https://astral.sh/uv/install.ps1'
 
 # Set to $true to run 'git submodule update --init --recursive --force'.
 $UPDATE_SUBMODULES = $false
@@ -151,16 +179,6 @@ function Get-PythonVersion {
     return $null
 }
 
-function Test-PythonExcluded {
-    param([version]$Version)
-    $short = "$($Version.Major).$($Version.Minor)"
-    $full = "$short.$($Version.Build)"
-    foreach ($entry in $INCOMPATIBLE_PYTHON) {
-        if ("$entry" -eq $short -or "$entry" -eq $full) { return $true }
-    }
-    return $false
-}
-
 function Test-InsideFolder {
     param([string]$Path, [string]$Folder)
     if (-not $Folder) { return $false }
@@ -168,52 +186,42 @@ function Test-InsideFolder {
     return [IO.Path]::GetFullPath($Path).StartsWith($f, [StringComparison]::OrdinalIgnoreCase)
 }
 
-function Find-Python {
-    # Collect candidate interpreters from the py launcher and from PATH.
-    $paths = New-Object System.Collections.Generic.List[string]
+# Returns the path of an existing uv executable, or $null.
+function Find-Uv {
+    $cmd = Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    foreach ($dir in @($UV_INSTALL_DIR, (Join-Path $HOME '.cargo\bin'))) {
+        $path = Join-Path $dir 'uv.exe'
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+    }
+    return $null
+}
 
-    $launcher = Get-Command py.exe -CommandType Application -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($launcher) {
-        try {
-            foreach ($line in @(& $launcher.Source --list-paths 2>$null)) {
-                if ("$line" -match '([A-Za-z]:\\.*?\.exe)') { $paths.Add($Matches[1]) }
-            }
+# Runs the official standalone installer in a child PowerShell, without touching PATH.
+function Install-Uv {
+    Write-Host "uv was not found, installing it into $UV_INSTALL_DIR..."
+    $dir = $UV_INSTALL_DIR.Replace("'", "''")
+    $url = $UV_INSTALLER_URL.Replace("'", "''")
+    $command = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; " +
+        "`$env:UV_INSTALL_DIR = '$dir'; `$env:UV_NO_MODIFY_PATH = '1'; " +
+        "Invoke-RestMethod '$url' | Invoke-Expression"
+    $shell = (Get-Process -Id $PID).Path
+    Invoke-Checked -FilePath $shell -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command) | Out-Host
+}
+
+function Get-Uv {
+    Write-Step 'Looking for uv...'
+    $uv = Find-Uv
+    if (-not $uv) {
+        if (-not $AUTO_INSTALL_UV) {
+            throw 'uv was not found. Install it (https://docs.astral.sh/uv/getting-started/installation/) or set $AUTO_INSTALL_UV = $true.'
         }
-        catch { }
+        Install-Uv
+        $uv = Join-Path $UV_INSTALL_DIR 'uv.exe'
+        if (-not (Test-Path -LiteralPath $uv -PathType Leaf)) { throw "uv was installed but '$uv' was not found." }
     }
-    foreach ($cmd in @(Get-Command python.exe, python3.exe -All -CommandType Application -ErrorAction SilentlyContinue)) {
-        $paths.Add($cmd.Source)
-    }
-
-    $seen = @{}
-    $found = foreach ($p in $paths) {
-        if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { continue }
-        $full = [IO.Path]::GetFullPath($p)
-        if ($seen.ContainsKey($full)) { continue }
-        $seen[$full] = $true
-
-        # Never use a virtual environment's interpreter (especially the one we are about to delete).
-        if ((Test-InsideFolder $full (Join-Path $REPO_ROOT $VENV_DIR)) -or
-            (Test-InsideFolder $full $env:VIRTUAL_ENV) -or
-            (Test-Path -LiteralPath (Join-Path (Split-Path -Parent (Split-Path -Parent $full)) 'pyvenv.cfg'))) { continue }
-
-        $version = Get-PythonVersion $full
-        if (-not $version) { continue }
-
-        [PSCustomObject]@{
-            Version  = $version
-            Excluded = Test-PythonExcluded $version
-            Path     = $full
-        }
-    }
-
-    $found = @($found | Sort-Object Version -Descending)
-    foreach ($f in $found) {
-        $status = if ($f.Excluded) { 'excluded' } else { 'ok' }
-        Write-Host ("  {0,-8} {1,-9} {2}" -f $f.Version, $status, $f.Path)
-    }
-    return $found | Where-Object { -not $_.Excluded } | Select-Object -First 1
+    Write-Host "Using $(& $uv --version) : $uv" -ForegroundColor Green
+    return $uv
 }
 
 function Update-Submodules {
@@ -320,21 +328,30 @@ function Copy-PipConfig {
     Copy-Item -LiteralPath (Get-PipConfigPath) -Destination (Join-Path $VenvPath 'pip.ini') -Force
 }
 
-function Install-Tools {
-    param([string]$VenvPython)
-    Write-Step 'Upgrading pip and installing uv...'
-    Invoke-Checked -FilePath $VenvPython -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip', 'uv')
+# Creates the venv with the requested Python; uv downloads it if it's not installed.
+# --seed puts pip into the venv, so plain 'pip' / 'python -m pip' keep working.
+function New-Venv {
+    param([string]$Uv)
+    $request = if ($Python) { $Python } else { $PYTHON_VERSION }
+    $label = if ($request) { "Python $request" } else { 'the default Python' }
+    Write-Step "Creating the virtual environment ($VENV_DIR) with $label..."
+    Write-Host 'uv downloads this Python if no matching installation is found.'
+
+    $venvArgs = @('venv', $VENV_DIR, '--seed', '--python-preference', $PYTHON_PREFERENCE)
+    if ($request) { $venvArgs += @('--python', $request) }
+    $venvArgs += Get-UvIndexArgs (Get-PipConfigPath)
+    Invoke-Checked -FilePath $Uv -Arguments $venvArgs
 }
 
 function Invoke-UvPip {
-    param([string]$VenvPython, [string[]]$Arguments)
-    $uvArgs = @('-m', 'uv', 'pip', 'install', '--python', $VenvPython) + $Arguments +
+    param([string]$Uv, [string]$VenvPython, [string[]]$Arguments)
+    $uvArgs = @('pip', 'install', '--python', $VenvPython) + $Arguments +
         (Get-UvIndexArgs (Get-PipConfigPath))
-    Invoke-Checked -FilePath $VenvPython -Arguments $uvArgs
+    Invoke-Checked -FilePath $Uv -Arguments $uvArgs
 }
 
 function Install-Requirements {
-    param([string]$VenvPython, [switch]$Upgrade)
+    param([string]$Uv, [string]$VenvPython, [switch]$Upgrade)
     foreach ($req in $REQUIREMENTS_FILES) {
         if (-not (Test-Path -LiteralPath $req -PathType Leaf)) {
             Write-Host "Requirements file '$req' not found, skipping." -ForegroundColor Yellow
@@ -343,18 +360,18 @@ function Install-Requirements {
         Write-Step "Installing $req..."
         $reqArgs = @()
         if ($Upgrade) { $reqArgs += '--upgrade' }
-        Invoke-UvPip -VenvPython $VenvPython -Arguments ($reqArgs + @('-r', $req))
+        Invoke-UvPip -Uv $Uv -VenvPython $VenvPython -Arguments ($reqArgs + @('-r', $req))
     }
 }
 
 function Install-Editable {
-    param([string]$VenvPython)
+    param([string]$Uv, [string]$VenvPython)
     if (-not $INSTALL_EDITABLE) { return }
     if (-not ((Test-Path -LiteralPath 'setup.py') -or (Test-Path -LiteralPath 'pyproject.toml'))) {
         throw 'INSTALL_EDITABLE is enabled but neither setup.py nor pyproject.toml was found.'
     }
     Write-Step "Installing $APP_NAME in editable mode..."
-    Invoke-UvPip -VenvPython $VenvPython -Arguments @('-e', '.')
+    Invoke-UvPip -Uv $Uv -VenvPython $VenvPython -Arguments @('-e', '.')
 }
 
 # ============================================================
@@ -363,33 +380,11 @@ function Install-Editable {
 
 try {
     Write-Host "Installing $APP_NAME" -ForegroundColor Green
-    if (@($INCOMPATIBLE_PYTHON).Count -gt 0) {
-        Write-Host "Excluded Python versions: $($INCOMPATIBLE_PYTHON -join ', ')"
-    }
     $null = Get-PipConfigPath   # fail early, before anything is changed
+    if ($PYTHON_INSTALL_MIRROR) { $env:UV_PYTHON_INSTALL_MIRROR = $PYTHON_INSTALL_MIRROR }
 
-    # --- Python selection ---
-    if ($Python) {
-        Write-Step "Checking the requested Python ($Python)..."
-        $cmd = Get-Command $Python -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $cmd) { throw "Python '$Python' was not found." }
-        $version = Get-PythonVersion $cmd.Source
-        if (-not $version) { throw "'$($cmd.Source)' does not look like a working Python interpreter." }
-        if (Test-PythonExcluded $version) {
-            throw "Python $version is excluded for $APP_NAME (excluded: $($INCOMPATIBLE_PYTHON -join ', '))."
-        }
-        $PYTHON_EXE = $cmd.Source
-    }
-    else {
-        Write-Step 'Searching for a compatible Python installation...'
-        $selected = Find-Python
-        if (-not $selected) {
-            throw 'No compatible Python installation was found. Install a supported Python version or pass -Python <path>.'
-        }
-        $version = $selected.Version
-        $PYTHON_EXE = $selected.Path
-    }
-    Write-Host "Selected Python $version : $PYTHON_EXE" -ForegroundColor Green
+    # --- uv ---
+    $uv = Get-Uv
 
     # --- Submodules and links ---
     Update-Submodules
@@ -405,24 +400,25 @@ try {
         Remove-Item -LiteralPath $venvPath -Recurse -Force
     }
 
-    Write-Step "Creating the virtual environment ($VENV_DIR)..."
-    Invoke-Checked -FilePath $PYTHON_EXE -Arguments @('-m', 'venv', $VENV_DIR)
+    New-Venv -Uv $uv
 
     $venvPython = Join-Path $venvPath 'Scripts\python.exe'
     if (-not (Test-Path -LiteralPath $venvPython)) { throw "Virtual environment Python not found: $venvPython" }
+    $version = Get-PythonVersion $venvPython
+    if (-not $version) { throw "The virtual environment's Python is not working: $venvPython" }
+    Write-Host "Virtual environment Python $version" -ForegroundColor Green
 
-    # activate.bat in the repository root (hard link, symlinks need privileges).
-    # activate.bat stores the venv path itself, so a link works.
+    # activate.bat / activate.ps1 in the repository root: small wrappers that
+    # call the real scripts, so they keep working when the venv is recreated.
     $activateBat = Join-Path $REPO_ROOT 'activate.bat'
     if (Get-Item -LiteralPath $activateBat -Force -ErrorAction SilentlyContinue) {
         Remove-Item -LiteralPath $activateBat -Force
     }
-    New-Item -ItemType HardLink -Path $activateBat -Target (Join-Path $venvPath 'Scripts\activate.bat') | Out-Null
+    Set-Content -LiteralPath $activateBat -Encoding ascii -Value @(
+        '@REM Activates the virtual environment created by install.ps1.',
+        "@call `"%~dp0$VENV_DIR\Scripts\activate.bat`""
+    )
 
-    # activate.ps1 in the repository root. A link cannot be used here:
-    # Activate.ps1 derives the venv from its own location, so a link in the
-    # repository root would look for the venv one level above the repository.
-    # Use a small wrapper that dot-sources the real script instead.
     $activatePs1 = Join-Path $REPO_ROOT 'activate.ps1'
     if (Get-Item -LiteralPath $activatePs1 -Force -ErrorAction SilentlyContinue) {
         Remove-Item -LiteralPath $activatePs1 -Force
@@ -434,9 +430,8 @@ try {
 
     # --- Packages ---
     Copy-PipConfig -VenvPath $venvPath
-    Install-Tools -VenvPython $venvPython
-    Install-Requirements -VenvPython $venvPython
-    Install-Editable -VenvPython $venvPython
+    Install-Requirements -Uv $uv -VenvPython $venvPython
+    Install-Editable -Uv $uv -VenvPython $venvPython
 }
 catch {
     Stop-Script $_.Exception.Message

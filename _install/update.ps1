@@ -1,4 +1,4 @@
-# VERSION=2
+# VERSION=3
 # https://github.com/ageorge95/ag95_repo_base
 
 <#
@@ -12,11 +12,12 @@
     in sync with install.ps1.
 
     Steps:
-      1. Optionally update Git submodules.
-      2. Optionally recreate directory/file links.
-      3. Copy pip.ini into the virtual environment, upgrade pip/uv and upgrade
+      1. Find uv (PATH or the uv install folder); install it if missing.
+      2. Optionally update Git submodules.
+      3. Optionally recreate directory/file links.
+      4. Copy pip.ini into the virtual environment, upgrade pip and upgrade
          the requirements with uv (using the indexes from pip.ini).
-      4. Optionally reinstall the repository itself in editable mode.
+      5. Optionally reinstall the repository itself in editable mode.
 
     Run install.ps1 first if the virtual environment does not exist yet.
 
@@ -51,11 +52,21 @@ $APP_NAME = Split-Path -Leaf $REPO_ROOT
 # Virtual environment folder, relative to the repository root.
 $VENV_DIR = 'venv'
 
-# Python versions that must NOT be used. Only used here to warn if the
-# existing virtual environment was built with an excluded version.
-#   '3.12'   excludes every 3.12.x
-#   '3.12.1' excludes only 3.12.1
-$INCOMPATIBLE_PYTHON = @('2.7', '3.6', '3.7', '3.8')
+# Allowed Python versions (same value as in install.ps1). Used here to stop if
+# the existing virtual environment's Python is outside the range.
+#   '>=3.10,<3.14'   any 3.10.x - 3.13.x
+#   '3.12'           only 3.12.x
+$PYTHON_VERSION = '>=3.14,<3.15'
+
+# Set to $true to install uv automatically when it's not found.
+$AUTO_INSTALL_UV = $true
+
+# Where uv is installed when it's missing (shared by all repositories).
+# The user PATH is NOT modified; the scripts also look here.
+$UV_INSTALL_DIR = Join-Path $HOME '.local\bin'
+
+# Official uv installer. Pin a version with e.g. 'https://astral.sh/uv/0.9.0/install.ps1'.
+$UV_INSTALLER_URL = 'https://astral.sh/uv/install.ps1'
 
 # Set to $true to run 'git submodule update --init --recursive --force'.
 $UPDATE_SUBMODULES = $false
@@ -137,14 +148,63 @@ function Get-PythonVersion {
     return $null
 }
 
-function Test-PythonExcluded {
-    param([version]$Version)
-    $short = "$($Version.Major).$($Version.Minor)"
-    $full = "$short.$($Version.Build)"
-    foreach ($entry in $INCOMPATIBLE_PYTHON) {
-        if ("$entry" -eq $short -or "$entry" -eq $full) { return $true }
+# Asks the venv's Python whether it is inside $PYTHON_VERSION, using the
+# 'packaging' copy bundled with pip. A bare version like '3.12' means '3.12.*'.
+# Returns $true, $false, or $null when the check can't be done.
+$PYTHON_RANGE_CHECK = @'
+import re,sys; from pip._vendor.packaging.specifiers import SpecifierSet as S; r=sys.argv[1].strip(); r=('=='+r+'.*') if re.fullmatch(r'\d+(\.\d+)?',r) else ('=='+r) if re.fullmatch(r'\d+\.\d+\.\d+',r) else r; print(S(r).contains('%d.%d.%d' % sys.version_info[:3], prereleases=True))
+'@
+
+function Test-PythonInRange {
+    param([string]$VenvPython)
+    if (-not $PYTHON_VERSION) { return $true }
+    try {
+        $out = @(& $VenvPython -c $PYTHON_RANGE_CHECK $PYTHON_VERSION 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $out.Count -gt 0) {
+            if ("$($out[-1])" -eq 'True') { return $true }
+            if ("$($out[-1])" -eq 'False') { return $false }
+        }
     }
-    return $false
+    catch { }
+    return $null
+}
+
+# Returns the path of an existing uv executable, or $null.
+function Find-Uv {
+    $cmd = Get-Command uv.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    foreach ($dir in @($UV_INSTALL_DIR, (Join-Path $HOME '.cargo\bin'))) {
+        $path = Join-Path $dir 'uv.exe'
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return $path }
+    }
+    return $null
+}
+
+# Runs the official standalone installer in a child PowerShell, without touching PATH.
+function Install-Uv {
+    Write-Host "uv was not found, installing it into $UV_INSTALL_DIR..."
+    $dir = $UV_INSTALL_DIR.Replace("'", "''")
+    $url = $UV_INSTALLER_URL.Replace("'", "''")
+    $command = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; " +
+        "`$env:UV_INSTALL_DIR = '$dir'; `$env:UV_NO_MODIFY_PATH = '1'; " +
+        "Invoke-RestMethod '$url' | Invoke-Expression"
+    $shell = (Get-Process -Id $PID).Path
+    Invoke-Checked -FilePath $shell -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $command) | Out-Host
+}
+
+function Get-Uv {
+    Write-Step 'Looking for uv...'
+    $uv = Find-Uv
+    if (-not $uv) {
+        if (-not $AUTO_INSTALL_UV) {
+            throw 'uv was not found. Install it (https://docs.astral.sh/uv/getting-started/installation/) or set $AUTO_INSTALL_UV = $true.'
+        }
+        Install-Uv
+        $uv = Join-Path $UV_INSTALL_DIR 'uv.exe'
+        if (-not (Test-Path -LiteralPath $uv -PathType Leaf)) { throw "uv was installed but '$uv' was not found." }
+    }
+    Write-Host "Using $(& $uv --version) : $uv" -ForegroundColor Green
+    return $uv
 }
 
 function Update-Submodules {
@@ -251,21 +311,22 @@ function Copy-PipConfig {
     Copy-Item -LiteralPath (Get-PipConfigPath) -Destination (Join-Path $VenvPath 'pip.ini') -Force
 }
 
-function Install-Tools {
-    param([string]$VenvPython)
-    Write-Step 'Upgrading pip and installing uv...'
-    Invoke-Checked -FilePath $VenvPython -Arguments @('-m', 'pip', 'install', '--upgrade', 'pip', 'uv')
+function Invoke-UvPip {
+    param([string]$Uv, [string]$VenvPython, [string[]]$Arguments)
+    $uvArgs = @('pip', 'install', '--python', $VenvPython) + $Arguments +
+        (Get-UvIndexArgs (Get-PipConfigPath))
+    Invoke-Checked -FilePath $Uv -Arguments $uvArgs
 }
 
-function Invoke-UvPip {
-    param([string]$VenvPython, [string[]]$Arguments)
-    $uvArgs = @('-m', 'uv', 'pip', 'install', '--python', $VenvPython) + $Arguments +
-        (Get-UvIndexArgs (Get-PipConfigPath))
-    Invoke-Checked -FilePath $VenvPython -Arguments $uvArgs
+# Keeps the venv's own pip current, so plain 'pip' inside the venv keeps working.
+function Update-Pip {
+    param([string]$Uv, [string]$VenvPython)
+    Write-Step 'Upgrading pip...'
+    Invoke-UvPip -Uv $Uv -VenvPython $VenvPython -Arguments @('--upgrade', 'pip')
 }
 
 function Install-Requirements {
-    param([string]$VenvPython, [switch]$Upgrade)
+    param([string]$Uv, [string]$VenvPython, [switch]$Upgrade)
     foreach ($req in $REQUIREMENTS_FILES) {
         if (-not (Test-Path -LiteralPath $req -PathType Leaf)) {
             Write-Host "Requirements file '$req' not found, skipping." -ForegroundColor Yellow
@@ -274,18 +335,18 @@ function Install-Requirements {
         Write-Step "Upgrading $req..."
         $reqArgs = @()
         if ($Upgrade) { $reqArgs += '--upgrade' }
-        Invoke-UvPip -VenvPython $VenvPython -Arguments ($reqArgs + @('-r', $req))
+        Invoke-UvPip -Uv $Uv -VenvPython $VenvPython -Arguments ($reqArgs + @('-r', $req))
     }
 }
 
 function Install-Editable {
-    param([string]$VenvPython)
+    param([string]$Uv, [string]$VenvPython)
     if (-not $INSTALL_EDITABLE) { return }
     if (-not ((Test-Path -LiteralPath 'setup.py') -or (Test-Path -LiteralPath 'pyproject.toml'))) {
         throw 'INSTALL_EDITABLE is enabled but neither setup.py nor pyproject.toml was found.'
     }
     Write-Step "Reinstalling $APP_NAME in editable mode..."
-    Invoke-UvPip -VenvPython $VenvPython -Arguments @('-e', '.')
+    Invoke-UvPip -Uv $Uv -VenvPython $VenvPython -Arguments @('-e', '.')
 }
 
 # ============================================================
@@ -305,17 +366,24 @@ try {
         throw "The virtual environment's Python is not working. Run install.ps1 to recreate it."
     }
     Write-Host "Virtual environment Python $version"
-    if (Test-PythonExcluded $version) {
-        Write-Host "WARNING: Python $version is excluded for $APP_NAME. Run install.ps1 to recreate the virtual environment." -ForegroundColor Yellow
+    $inRange = Test-PythonInRange $venvPython
+    if ($inRange -eq $false) {
+        throw "Python $version is outside the allowed range '$PYTHON_VERSION' for $APP_NAME. Run install.ps1 to recreate the virtual environment."
     }
+    if ($null -eq $inRange) {
+        Write-Host "WARNING: could not check Python $version against '$PYTHON_VERSION' (pip missing from the venv?)." -ForegroundColor Yellow
+    }
+    $null = Get-PipConfigPath   # fail early, before anything is changed
+
+    $uv = Get-Uv
 
     Update-Submodules
     New-RepoLinks
 
     Copy-PipConfig -VenvPath (Join-Path $REPO_ROOT $VENV_DIR)
-    Install-Tools -VenvPython $venvPython
-    Install-Requirements -VenvPython $venvPython -Upgrade
-    Install-Editable -VenvPython $venvPython
+    Update-Pip -Uv $uv -VenvPython $venvPython
+    Install-Requirements -Uv $uv -VenvPython $venvPython -Upgrade
+    Install-Editable -Uv $uv -VenvPython $venvPython
 }
 catch {
     Stop-Script $_.Exception.Message
